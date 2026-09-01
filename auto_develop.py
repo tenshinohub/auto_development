@@ -1426,6 +1426,398 @@ def apply_sharpen(
 
 
 # ============================================================
+# Score
+# ============================================================
+
+def calculate_auto_score(image):
+    """
+    現像結果の自動評価。
+
+    高評価:
+        - ハイライトのクリップが少ない
+        - シャドウのクリップが少ない
+        - 中間調が適度
+        - コントラストがある
+        - 彩度が過剰ではない
+
+    低評価:
+        - 白飛び過多
+        - 黒つぶれ過多
+        - 彩度過多
+        - コントラスト不足
+    """
+
+    luminance = calculate_luminance(
+        image
+    )
+
+    # --------------------------------------------------------
+    # ハイライト
+    # --------------------------------------------------------
+
+    highlight_ratio = np.mean(
+        luminance > 0.98
+    )
+
+    severe_highlight = np.mean(
+        luminance > 0.995
+    )
+
+    highlight_score = (
+        1.0
+        - min(
+            highlight_ratio * 8.0,
+            1.0,
+        )
+        - min(
+            severe_highlight * 12.0,
+            1.0,
+        )
+    )
+
+    # --------------------------------------------------------
+    # シャドウ
+    # --------------------------------------------------------
+
+    shadow_ratio = np.mean(
+        luminance < 0.02
+    )
+
+    severe_shadow = np.mean(
+        luminance < 0.005
+    )
+
+    shadow_score = (
+        1.0
+        - min(
+            shadow_ratio * 5.0,
+            1.0,
+        )
+        - min(
+            severe_shadow * 8.0,
+            1.0,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 中間調
+    # --------------------------------------------------------
+
+    midtone_ratio = np.mean(
+        (
+            luminance > 0.15
+        )
+        &
+        (
+            luminance < 0.85
+        )
+    )
+
+    midtone_score = min(
+        midtone_ratio * 1.5,
+        1.0,
+    )
+
+    # --------------------------------------------------------
+    # コントラスト
+    # --------------------------------------------------------
+
+    p05 = np.percentile(
+        luminance,
+        5,
+    )
+
+    p95 = np.percentile(
+        luminance,
+        95,
+    )
+
+    dynamic_range = (
+        p95 - p05
+    )
+
+    if dynamic_range < 0.25:
+
+        contrast_score = (
+            dynamic_range
+            / 0.25
+        )
+
+    elif dynamic_range > 0.90:
+
+        contrast_score = (
+            1.0
+            - (
+                dynamic_range
+                - 0.90
+            )
+            * 2.0
+        )
+
+    else:
+
+        contrast_score = 1.0
+
+    contrast_score = float(
+        np.clip(
+            contrast_score,
+            0.0,
+            1.0,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Saturation
+    # --------------------------------------------------------
+
+    max_rgb = np.max(
+        image,
+        axis=2,
+    )
+
+    min_rgb = np.min(
+        image,
+        axis=2,
+    )
+
+    chroma = (
+        max_rgb
+        - min_rgb
+    )
+
+    oversaturated = np.mean(
+        chroma > 0.75
+    )
+
+    saturation_score = (
+        1.0
+        - min(
+            oversaturated * 4.0,
+            1.0,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 総合
+    # --------------------------------------------------------
+
+    score = (
+        highlight_score * 0.30
+        + shadow_score * 0.20
+        + midtone_score * 0.20
+        + contrast_score * 0.20
+        + saturation_score * 0.10
+    )
+
+    return float(score)
+
+# ============================================================
+# Generate Candidates
+# ============================================================
+
+def generate_candidates(
+    base_ev,
+    base_contrast,
+    base_saturation,
+):
+    """
+    現像候補を生成する。
+
+    大量に生成するとCPU負荷が高くなるので、
+    まずは粗い探索を行う。
+    """
+
+    ev_offsets = [
+        -0.30,
+        0.00,
+        0.30,
+    ]
+
+    contrast_offsets = [
+        -0.08,
+        0.00,
+        0.08,
+    ]
+
+    saturation_offsets = [
+        -0.05,
+        0.00,
+        0.05,
+    ]
+
+    candidates = []
+
+    for ev_offset in ev_offsets:
+
+        for contrast_offset in contrast_offsets:
+
+            for saturation_offset in saturation_offsets:
+
+                candidates.append(
+                    {
+                        "ev": (
+                            base_ev
+                            + ev_offset
+                        ),
+                        "contrast": (
+                            base_contrast
+                            + contrast_offset
+                        ),
+                        "saturation": (
+                            base_saturation
+                            + saturation_offset
+                        ),
+                    }
+                )
+
+    return candidates
+
+# ============================================================
+# Render Candidates
+# ============================================================
+
+def render_candidate(
+    image,
+    params,
+):
+    """
+    1つの現像候補を生成する。
+    """
+
+    result = image.copy()
+
+    # --------------------------------------------------------
+    # Exposure
+    # --------------------------------------------------------
+
+    gain = 2.0 ** params["ev"]
+
+    result = apply_exposure(
+        result,
+        gain,
+    )
+
+    # --------------------------------------------------------
+    # Contrast
+    # --------------------------------------------------------
+
+    result = apply_contrast(
+        result,
+        params["contrast"],
+    )
+
+    # --------------------------------------------------------
+    # Saturation
+    # --------------------------------------------------------
+
+    mask = np.ones(
+        result.shape[:2],
+        dtype=np.float32,
+    )
+
+    result = apply_local_saturation(
+        result,
+        mask,
+        params["saturation"],
+    )
+
+    return result
+
+# ============================================================
+# Auto Tune
+# ============================================================
+
+def auto_tune(
+    image,
+    analysis,
+):
+    """
+    複数の現像候補を作り、
+    スコアが最高のものを選択する。
+    """
+
+    base_gain, base_ev = (
+        calculate_exposure(
+            analysis
+        )
+    )
+
+    base_contrast = (
+        calculate_contrast(
+            analysis
+        )
+    )
+
+    base_saturation = (
+        calculate_saturation(
+            image
+        )
+    )
+
+    candidates = generate_candidates(
+        base_ev,
+        base_contrast,
+        base_saturation,
+    )
+
+    logging.info(
+        "Auto tuning: %d candidates",
+        len(candidates),
+    )
+
+    best_score = -float("inf")
+    best_image = None
+    best_params = None
+
+    for index, params in enumerate(
+        candidates
+    ):
+
+        candidate = render_candidate(
+            image,
+            params,
+        )
+
+        score = calculate_auto_score(
+            candidate
+        )
+
+        logging.debug(
+            "Candidate %03d score=%.4f "
+            "EV=%.2f contrast=%.3f "
+            "saturation=%.3f",
+            index,
+            score,
+            params["ev"],
+            params["contrast"],
+            params["saturation"],
+        )
+
+        if score > best_score:
+
+            best_score = score
+            best_image = candidate
+            best_params = params
+
+    logging.info(
+        "Best candidate:"
+        " score=%.4f"
+        " EV=%.2f"
+        " contrast=%.3f"
+        " saturation=%.3f",
+        best_score,
+        best_params["ev"],
+        best_params["contrast"],
+        best_params["saturation"],
+    )
+
+    return (
+        best_image,
+        best_params,
+        best_score,
+    )
+
+# ============================================================
 # Auto Develop
 # ============================================================
 
@@ -1487,6 +1879,69 @@ def auto_develop(
     # Global exposure
     # ========================================================
 
+    tuned_image, tuned_params, tuned_score = (
+        auto_tune(
+            image,
+            global_analysis,
+        )
+    )
+
+    logging.info(
+        "Selected parameters: %s",
+        tuned_params,
+    )
+
+    #image = tuned_image
+    
+    # Sky
+
+    sky = masks["sky"]
+
+    if np.mean(sky > 0.25) > 0.005:
+
+        image = apply_local_exposure(
+            image,
+            sky,
+            0.94,
+        )
+
+        image = apply_local_saturation(
+            image,
+            sky,
+            1.08,
+        )
+
+    # Person
+
+    person = masks["person"]
+
+    if np.mean(person > 0.25) > 0.002:
+
+        image = apply_local_exposure(
+            image,
+            person,
+            1.06,
+        )
+
+        image = apply_local_saturation(
+            image,
+            person,
+            0.98,
+        )
+
+    # Plant
+
+    plant = masks["plant"]
+
+    if np.mean(plant > 0.25) > 0.002:
+
+        image = apply_local_saturation(
+            image,
+            plant,
+            1.05,
+        )
+    
+    """
     gain, ev = calculate_exposure(
         global_analysis
     )
@@ -1500,6 +1955,7 @@ def auto_develop(
         image,
         gain,
     )
+    """
 
     # ========================================================
     # White balance
