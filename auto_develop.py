@@ -560,6 +560,87 @@ def calculate_exposure(
     analysis,
 ):
 
+    """
+    ヒストグラムから自動露出を決定する。
+
+    平均値だけではなく、
+    median / p05 / p95 を利用する。
+    """
+
+    median = analysis.median
+    p05 = analysis.p05
+    p95 = analysis.p95
+
+    # --------------------------------------------------------
+    # 基本露出
+    # --------------------------------------------------------
+
+    reference = (
+        median * 0.65
+        + p05 * 0.10
+        + p95 * 0.25
+    )
+
+    target = 0.42
+
+    ratio = (
+        target
+        / max(reference, 0.001)
+    )
+
+    ev = math.log2(
+        ratio
+    )
+
+    # --------------------------------------------------------
+    # Dynamic Rangeが広い場合
+    # --------------------------------------------------------
+
+    if analysis.dynamic_range > 0.85:
+
+        # 明るくしすぎない
+        ev -= 0.15
+
+    # --------------------------------------------------------
+    # ハイライトが危険な場合
+    # --------------------------------------------------------
+
+    if analysis.highlight_ratio > 0.003:
+
+        ev -= 0.20
+
+    elif analysis.highlight_ratio > 0.001:
+
+        ev -= 0.08
+
+    # --------------------------------------------------------
+    # シャドウが多い場合
+    # --------------------------------------------------------
+
+    if (
+        analysis.shadow_ratio > 0.35
+        and analysis.highlight_ratio < 0.001
+    ):
+
+        ev += 0.15
+
+    # --------------------------------------------------------
+    # 過剰補正を防ぐ
+    # --------------------------------------------------------
+
+    ev = float(
+        np.clip(
+            ev,
+            -1.5,
+            1.5,
+        )
+    )
+
+    gain = 2.0 ** ev
+
+    return gain, ev
+    
+    """
     reference = (
         0.6 * analysis.mean
         + 0.4 * analysis.median
@@ -608,7 +689,7 @@ def calculate_exposure(
     )
 
     return gain, math.log2(gain)
-
+    """
 
 # ============================================================
 # Exposure
@@ -632,8 +713,139 @@ def apply_exposure(
 
 def calculate_auto_wb(
     image,
+    sky_mask=None,
 ):
+    """
+    色かぶりを抑えるための自動WB。
 
+    Gray Worldをそのまま使うのではなく、
+
+    - 極端な暗部
+    - 極端なハイライト
+    - 高彩度領域
+    - 空
+
+    をWB推定から除外する。
+
+    戻り値:
+        RGB gain
+    """
+
+    r = image[:, :, 0]
+    g = image[:, :, 1]
+    b = image[:, :, 2]
+
+    luminance = calculate_luminance(
+        image
+    )
+
+    max_rgb = np.maximum.reduce(
+        [r, g, b]
+    )
+
+    min_rgb = np.minimum.reduce(
+        [r, g, b]
+    )
+
+    chroma = max_rgb - min_rgb
+
+    # --------------------------------------------------------
+    # WB候補領域
+    # --------------------------------------------------------
+
+    mask = (
+        (luminance > 0.12)
+        &
+        (luminance < 0.85)
+        &
+        (chroma < 0.12)
+    )
+
+    # 空はWB計算から除外
+    if sky_mask is not None:
+        mask &= (
+            sky_mask < 0.30
+        )
+
+    if np.sum(mask) < 1000:
+        logging.info(
+            "Not enough WB pixels. "
+            "Using camera WB."
+        )
+
+        return np.ones(
+            3,
+            dtype=np.float32,
+        )
+
+    # --------------------------------------------------------
+    # Robust RGB statistics
+    # --------------------------------------------------------
+
+    r_values = r[mask]
+    g_values = g[mask]
+    b_values = b[mask]
+
+    r_mean = float(
+        np.median(r_values)
+    )
+
+    g_mean = float(
+        np.median(g_values)
+    )
+
+    b_mean = float(
+        np.median(b_values)
+    )
+
+    target = (
+        r_mean
+        + g_mean
+        + b_mean
+    ) / 3.0
+
+    gains = np.array(
+        [
+            target / max(r_mean, 1e-6),
+            target / max(g_mean, 1e-6),
+            target / max(b_mean, 1e-6),
+        ],
+        dtype=np.float32,
+    )
+
+    # --------------------------------------------------------
+    # 強すぎるWB補正は禁止
+    # --------------------------------------------------------
+
+    gains = np.clip(
+        gains,
+        0.90,
+        1.10,
+    )
+
+    # Greenを基準にする
+    gains /= gains[1]
+
+    logging.info(
+        "Auto WB statistics: "
+        "R=%.3f G=%.3f B=%.3f",
+        r_mean,
+        g_mean,
+        b_mean,
+    )
+
+    logging.info(
+        "Auto WB gains: "
+        "R=%.3f G=%.3f B=%.3f",
+        gains[0],
+        gains[1],
+        gains[2],
+    )
+
+    return gains
+
+
+    """
     means = np.mean(
         image.reshape(-1, 3),
         axis=0,
@@ -660,6 +872,7 @@ def calculate_auto_wb(
     return gains.astype(
         np.float32
     )
+    """
 
 
 def apply_white_balance(
@@ -767,6 +980,59 @@ def recover_highlights(
     strength=0.30,
 ):
 
+    """
+    ハイライトを緩やかに圧縮する。
+
+    完全な白飛び領域は無理に復元しない。
+    """
+
+    if np.max(mask) <= 0:
+        return image
+
+    luminance = calculate_luminance(
+        image
+    )
+
+    # 0.75～1.0の領域だけ対象
+    soft_mask = np.clip(
+        (luminance - 0.75)
+        / 0.25,
+        0.0,
+        1.0,
+    )
+
+    soft_mask = (
+        soft_mask
+        * soft_mask
+    )
+
+    soft_mask *= mask
+
+    # 完全白はほぼそのまま
+    recoverable = (
+        1.0 - np.clip(
+            (luminance - 0.96)
+            / 0.04,
+            0.0,
+            1.0,
+        )
+    )
+
+    soft_mask *= recoverable
+
+    result = image / (
+        1.0
+        + strength
+        * soft_mask[:, :, None]
+    )
+
+    return np.clip(
+        result,
+        0.0,
+        1.0,
+    )
+    
+    """
     if np.max(mask) <= 0:
         return image
 
@@ -781,6 +1047,7 @@ def recover_highlights(
         0.0,
         1.0,
     )
+    """
 
 
 # ============================================================
@@ -859,6 +1126,62 @@ def apply_tone_curve(
 
     return curve[index]
 
+def apply_adaptive_tone_curve(
+    image,
+    analysis,
+):
+    """
+    Dynamic Rangeに応じて
+    トーンカーブの強さを変える。
+    """
+
+    dr = analysis.dynamic_range
+
+    if dr < 0.25:
+        strength = 1.0
+
+    elif dr < 0.40:
+        strength = 0.70
+
+    elif dr < 0.60:
+        strength = 0.45
+
+    elif dr < 0.80:
+        strength = 0.20
+
+    else:
+        strength = 0.05
+
+    x = np.linspace(
+        0.0,
+        1.0,
+        4096,
+    )
+
+    curve = (
+        x
+        + strength
+        * 0.12
+        * x
+        * (1.0 - x)
+        * (2.0 * x - 1.0)
+    )
+
+    curve = np.clip(
+        curve,
+        0.0,
+        1.0,
+    )
+
+    index = np.clip(
+        image * 4095.0,
+        0,
+        4095,
+    ).astype(
+        np.int32
+    )
+
+    return curve[index]
 
 # ============================================================
 # Contrast
@@ -1183,7 +1506,8 @@ def auto_develop(
     # ========================================================
 
     wb = calculate_auto_wb(
-        image
+        image,
+        masks["sky"],
     )
 
     logging.info(
@@ -1298,9 +1622,16 @@ def auto_develop(
     # Tone curve
     # ========================================================
 
+    image = apply_adaptive_tone_curve(
+        image,
+        global_analysis,
+    )
+    
+    """
     image = apply_tone_curve(
         image
     )
+    """
 
     # ========================================================
     # Global saturation
