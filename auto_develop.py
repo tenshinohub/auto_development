@@ -2,87 +2,98 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v14
+auto_develop_v15.py
 
-Automatic development based on:
+Automatic RAW development v15
 
-    RAW
-      |
-      +-- Camera metadata
-      |     +-- Make / Model
-      |     +-- Lens
-      |     +-- ISO
-      |     +-- Shutter
-      |     +-- Aperture
-      |     +-- Focal length
-      |     +-- WB / Color temperature
-      |
-      +-- RAW characteristics
-      |     +-- Black level
-      |     +-- White level
-      |     +-- Camera WB
-      |     +-- RGB->XYZ matrix
-      |
-      +-- Image analysis
-      |
-      +-- Semantic segmentation
-      |
-      +-- Saliency
-      |
-      +-- Scene classification
-      |
-      +-- Shooting-condition analysis
-      |
-      +-- Automatic parameter search
-      |
-      +-- Local subject development
-      |
-      +-- Tone / CLAHE
-      |
-      +-- Denoise
-      |
-      +-- Sharpen
-      |
-      +-- JPEG
+Pipeline:
 
-Requirements
-------------
+RAW
+ ↓
+LibRaw / rawpy
+ ↓
+Camera RGB
+ ↓
+Camera RGB -> XYZ -> linear sRGB
+ ↓
+Image analysis
+ ↓
+Semantic segmentation
+ ↓
+Saliency
+ ↓
+Subject ranking
+ ↓
+Scene classification
+ ↓
+Global parameter optimization
+ ↓
+Region-aware development
+   ├─ sky
+   ├─ person
+   ├─ animal
+   ├─ vegetation
+   ├─ building
+   ├─ vehicle
+   ├─ water
+   └─ background
+ ↓
+Luminance tone mapping
+ ↓
+Denoise
+ ↓
+Sharpen
+ ↓
+JPEG
 
-    pip install rawpy pillow numpy opencv-python torch torchvision
+Usage:
 
-Optional but strongly recommended:
+    python3 auto_develop_v15.py ./RAW -o ./output --device cuda
+
+Requirements:
+
+    pip install rawpy numpy opencv-python pillow torch torchvision scipy
+
+Optional:
 
     sudo apt install exiftool
-
-Usage
------
-
-    python3 auto_develop_v14.py ./RAW \
-        -o ./output \
-        --device cuda
-
 """
-
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import re
-import shutil
+import os
 import subprocess
 import sys
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image, ExifTags
-
 import rawpy
+
+try:
+    from scipy.ndimage import gaussian_filter
+except ImportError:
+    gaussian_filter = None
+
+try:
+    import torch
+    import torchvision
+    import torchvision.transforms.functional as TF
+except ImportError:
+    torch = None
+    torchvision = None
+    TF = None
+
+try:
+    from PIL import Image, ExifTags
+except ImportError:
+    Image = None
+    ExifTags = None
 
 
 # ============================================================
@@ -103,6 +114,7 @@ RAW_EXTENSIONS = {
     ".srw",
 }
 
+
 VOC_CLASSES = [
     "background",
     "aeroplane",
@@ -112,6 +124,7 @@ VOC_CLASSES = [
     "bottle",
     "bus",
     "car",
+    "cat",
     "chair",
     "cow",
     "diningtable",
@@ -126,43 +139,57 @@ VOC_CLASSES = [
     "tvmonitor",
 ]
 
+CLASS_ID = {name: i for i, name in enumerate(VOC_CLASSES)}
+
+
 SUBJECT_CLASSES = {
-    "person",
-    "bird",
-    "bicycle",
-    "boat",
-    "bottle",
-    "bus",
-    "car",
-    "cat",
-    "cow",
-    "dog",
-    "horse",
-    "motorbike",
-    "person",
-    "pottedplant",
-    "sheep",
-    "train",
+    "person": 1.20,
+    "bird": 1.05,
+    "cat": 1.05,
+    "dog": 1.05,
+    "horse": 1.05,
+    "cow": 1.00,
+    "sheep": 1.00,
+    "car": 1.00,
+    "bus": 1.00,
+    "motorbike": 1.00,
+    "bicycle": 1.00,
+    "boat": 1.00,
+    "train": 1.00,
+    "pottedplant": 0.90,
+    "bottle": 0.85,
 }
 
-ANIMAL_CLASSES = {
-    "bird",
-    "cat",
-    "cow",
-    "dog",
-    "horse",
-    "sheep",
+
+REGION_CLASSES = {
+    "sky": [
+        "sky",
+    ],
+    "person": [
+        "person",
+    ],
+    "vegetation": [
+        "pottedplant",
+    ],
+    "vehicle": [
+        "car",
+        "bus",
+        "motorbike",
+        "bicycle",
+        "train",
+        "boat",
+    ],
 }
 
-VEHICLE_CLASSES = {
-    "aeroplane",
-    "bicycle",
-    "boat",
-    "bus",
-    "car",
-    "motorbike",
-    "train",
-}
+
+XYZ_TO_SRGB = np.array(
+    [
+        [ 3.2406, -1.5372, -0.4986],
+        [-0.9689,  1.8758,  0.0415],
+        [ 0.0557, -0.2040,  1.0570],
+    ],
+    dtype=np.float32,
+)
 
 
 # ============================================================
@@ -171,7 +198,6 @@ VEHICLE_CLASSES = {
 
 @dataclass
 class ExifMetadata:
-
     make: str = ""
     model: str = ""
 
@@ -192,45 +218,45 @@ class ExifMetadata:
 
 @dataclass
 class CameraProfile:
+    make: str = ""
+    model: str = ""
+    family: str = "unknown"
 
-    make: str
-    model: str
-    iso: int
+    iso: Optional[float] = None
 
-    black_level: np.ndarray
-    white_level: float
-    white_level_per_channel: np.ndarray
+    black_level: Optional[np.ndarray] = None
+    white_level: Optional[float] = None
+    white_level_per_channel: Optional[np.ndarray] = None
 
-    camera_wb: np.ndarray
+    camera_wb: Optional[np.ndarray] = None
 
-    color_matrix: np.ndarray
-    rgb_xyz_matrix: np.ndarray
+    color_matrix: Optional[np.ndarray] = None
+    rgb_xyz_matrix: Optional[np.ndarray] = None
 
-    color_desc: str
-    num_colors: int
+    color_desc: str = ""
+    num_colors: int = 3
 
-    raw_width: int
-    raw_height: int
-    raw_pattern: object
+    raw_width: int = 0
+    raw_height: int = 0
+    raw_pattern: Optional[np.ndarray] = None
 
-    lens_make: str
-    lens_model: str
+    lens_make: str = ""
+    lens_model: str = ""
 
-    exposure_time: Optional[float]
-    f_number: Optional[float]
-    focal_length: Optional[float]
+    exposure_time: Optional[float] = None
+    f_number: Optional[float] = None
+    focal_length: Optional[float] = None
 
-    white_balance: str
-    color_temperature: Optional[float]
-    color_space: str
+    white_balance: str = ""
+    color_temperature: Optional[float] = None
+    color_space: str = ""
 
-    metadata_source: str
-    libraw_version: str
+    metadata_source: str = "unknown"
+    libraw_version: str = ""
 
 
 @dataclass
-class ImageAnalysis:
-
+class ImageStats:
     mean: float
     median: float
 
@@ -253,48 +279,38 @@ class ImageAnalysis:
 
 @dataclass
 class ShootingCondition:
+    iso_factor: float = 0.0
+    low_light: float = 0.0
+    motion_risk: float = 0.0
+    shallow_dof: float = 0.0
+    wide_angle: float = 0.0
+    telephoto: float = 0.0
 
-    iso_factor: float
-    shutter_factor: float
-    aperture_factor: float
-    focal_factor: float
-
-    low_light: float
-    motion_risk: float
-    shallow_dof: float
-
-    wide_angle: float
-    telephoto: float
-
-    estimated_noise: float
+    estimated_noise: float = 0.0
 
 
 @dataclass
 class SubjectCandidate:
-
     class_name: str
-
     confidence: float
     area: float
     center_score: float
-    saliency_score: float
+    saliency: float
     local_contrast: float
     colorfulness: float
-
     score: float
+
+    mask: Optional[np.ndarray] = None
 
 
 @dataclass
 class SceneProfile:
-
-    name: str
-
     exposure: float
     contrast: float
     saturation: float
 
-    highlight: float
-    shadow: float
+    highlight_protection: float
+    shadow_lift: float
 
     subject_strength: float
     background_suppression: float
@@ -303,519 +319,189 @@ class SceneProfile:
     sharpen: float
 
 
+@dataclass
+class RegionProfile:
+    exposure: float = 0.0
+    contrast: float = 1.0
+    saturation: float = 1.0
+
+    highlight_protection: float = 0.0
+    shadow_lift: float = 0.0
+
+    clarity: float = 0.0
+    denoise: float = 0.0
+
+
 # ============================================================
 # Utility
 # ============================================================
 
 def clamp01(x):
-
-    return np.clip(
-        x,
-        0.0,
-        1.0,
-    )
+    return np.clip(x, 0.0, 1.0)
 
 
-def normalize_map(x):
-
-    x = x.astype(np.float32)
-
-    mn = float(np.min(x))
-    mx = float(np.max(x))
-
-    if mx - mn < 1e-8:
-        return np.zeros_like(x)
-
-    return (
-        (x - mn)
-        /
-        (mx - mn)
-    )
-
-
-def luminance(img):
-
-    return (
-        img[..., 0] * 0.2126
-        +
-        img[..., 1] * 0.7152
-        +
-        img[..., 2] * 0.0722
-    )
-
-
-def safe_float(value):
-
-    if value is None:
-        return None
-
-    if isinstance(
-        value,
-        (int, float),
-    ):
-        return float(value)
-
-    text = str(value).strip()
-
-    if not text:
-        return None
-
+def safe_float(v):
     try:
-        return float(text)
-
-    except ValueError:
-        pass
-
-    match = re.match(
-        r"^\s*"
-        r"(\d+(?:\.\d+)?)"
-        r"\s*/\s*"
-        r"(\d+(?:\.\d+)?)"
-        r"\s*$",
-        text,
-    )
-
-    if match:
-
-        numerator = float(
-            match.group(1)
-        )
-
-        denominator = float(
-            match.group(2)
-        )
-
-        if denominator != 0:
-            return (
-                numerator
-                /
-                denominator
-            )
-
-    return None
-
-
-def clean_text(value):
-
-    if value is None:
-        return ""
-
-    if isinstance(
-        value,
-        (list, tuple),
-    ):
-
-        return " ".join(
-            str(v)
-            for v in value
-        )
-
-    return str(value).strip()
-
-
-def first_nonempty(*values):
-
-    for value in values:
-
-        if value is None:
-            continue
-
-        if isinstance(
-            value,
-            str,
-        ):
-
-            if value.strip():
-                return value.strip()
-
-        else:
-            return value
-
-    return ""
-
-
-def get_array(
-    value,
-    dtype=np.float32,
-):
-
-    try:
-
-        return np.asarray(
-            value,
-            dtype=dtype,
-        )
-
+        return float(v)
     except Exception:
+        return None
 
-        return np.array(
-            [],
-            dtype=dtype,
-        )
+
+def normalize_percentile(x, p_low=0.5, p_high=99.5):
+    lo = np.percentile(x, p_low)
+    hi = np.percentile(x, p_high)
+
+    if hi <= lo + 1e-8:
+        return np.clip(x, 0.0, 1.0)
+
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def resize_for_analysis(img, max_size=768):
+    h, w = img.shape[:2]
+
+    scale = min(1.0, max_size / max(h, w))
+
+    if scale == 1.0:
+        return img
+
+    return cv2.resize(
+        img,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 # ============================================================
 # ExifTool
 # ============================================================
 
-def exiftool_available():
-
-    return (
-        shutil.which(
-            "exiftool"
-        )
-        is not None
-    )
-
-
-def read_exiftool(path):
-
-    if not exiftool_available():
-
-        return ExifMetadata(
-            source="not_available"
-        )
-
-    tags = [
-        "Make",
-        "Model",
-        "CameraModelName",
-        "UniqueCameraModel",
-
-        "LensMake",
-        "LensModel",
-
-        "ISO",
-        "ExposureTime",
-        "FNumber",
-        "FocalLength",
-
-        "WhiteBalance",
-        "ColorTemperature",
-        "ColorSpace",
-    ]
-
-    command = [
-        "exiftool",
-        "-j",
-        "-n",
-    ]
-
-    for tag in tags:
-
-        command.append(
-            f"-{tag}"
-        )
-
-    command.append(
-        str(path)
-    )
-
+def run_exiftool(path: Path):
     try:
-
         result = subprocess.run(
-            command,
+            [
+                "exiftool",
+                "-j",
+                "-n",
+                "-Make",
+                "-Model",
+                "-CameraModelName",
+                "-UniqueCameraModel",
+                "-LensMake",
+                "-LensModel",
+                "-ISO",
+                "-ExposureTime",
+                "-FNumber",
+                "-FocalLength",
+                "-WhiteBalance",
+                "-ColorTemperature",
+                "-ColorSpace",
+                str(path),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=20,
             check=False,
         )
 
-    except Exception:
+        if result.returncode != 0:
+            return None
 
-        return ExifMetadata(
-            source="exiftool_error"
-        )
-
-    if result.returncode != 0:
-
-        return ExifMetadata(
-            source="exiftool_error"
-        )
-
-    try:
-
-        data = json.loads(
-            result.stdout
-        )
+        data = json.loads(result.stdout)
 
         if not data:
+            return None
 
-            return ExifMetadata(
-                source="exiftool_empty"
-            )
-
-        d = data[0]
+        return data[0]
 
     except Exception:
-
-        return ExifMetadata(
-            source="exiftool_parse_error"
-        )
-
-    make = clean_text(
-        d.get("Make")
-    )
-
-    model = first_nonempty(
-        clean_text(
-            d.get("Model")
-        ),
-        clean_text(
-            d.get("CameraModelName")
-        ),
-        clean_text(
-            d.get("UniqueCameraModel")
-        ),
-    )
-
-    lens_make = clean_text(
-        d.get("LensMake")
-    )
-
-    lens_model = clean_text(
-        d.get("LensModel")
-    )
-
-    return ExifMetadata(
-
-        make=make,
-
-        model=model,
-
-        lens_make=lens_make,
-
-        lens_model=lens_model,
-
-        iso=safe_float(
-            d.get("ISO")
-        ),
-
-        exposure_time=safe_float(
-            d.get("ExposureTime")
-        ),
-
-        f_number=safe_float(
-            d.get("FNumber")
-        ),
-
-        focal_length=safe_float(
-            d.get("FocalLength")
-        ),
-
-        white_balance=clean_text(
-            d.get("WhiteBalance")
-        ),
-
-        color_temperature=safe_float(
-            d.get("ColorTemperature")
-        ),
-
-        color_space=clean_text(
-            d.get("ColorSpace")
-        ),
-
-        source="exiftool",
-    )
+        return None
 
 
-# ============================================================
-# Pillow fallback
-# ============================================================
-
-def read_pillow_exif(path):
+def read_pillow_exif(path: Path):
+    if Image is None:
+        return {}
 
     try:
+        img = Image.open(path)
+        exif = img.getexif()
 
-        with Image.open(path) as img:
+        if not exif:
+            return {}
 
-            exif = img.getexif()
+        result = {}
 
-            if not exif:
+        for tag_id, value in exif.items():
+            name = ExifTags.TAGS.get(tag_id, tag_id)
+            result[name] = value
 
-                return ExifMetadata(
-                    source="pillow_empty"
-                )
-
-            decoded = {}
-
-            for key, value in exif.items():
-
-                name = ExifTags.TAGS.get(
-                    key,
-                    str(key),
-                )
-
-                decoded[name] = value
-
-            return ExifMetadata(
-
-                make=clean_text(
-                    decoded.get("Make")
-                ),
-
-                model=clean_text(
-                    decoded.get("Model")
-                ),
-
-                lens_model=clean_text(
-                    decoded.get("LensModel")
-                ),
-
-                iso=safe_float(
-                    decoded.get(
-                        "ISOSpeedRatings"
-                    )
-                ),
-
-                exposure_time=safe_float(
-                    decoded.get(
-                        "ExposureTime"
-                    )
-                ),
-
-                f_number=safe_float(
-                    decoded.get(
-                        "FNumber"
-                    )
-                ),
-
-                focal_length=safe_float(
-                    decoded.get(
-                        "FocalLength"
-                    )
-                ),
-
-                source="pillow",
-            )
+        return result
 
     except Exception:
+        return {}
 
-        return ExifMetadata(
-            source="pillow_error"
+
+def extract_metadata(path: Path):
+    meta = ExifMetadata()
+
+    data = run_exiftool(path)
+
+    if data:
+        meta.source = "exiftool"
+
+        meta.make = str(
+            data.get("Make")
+            or data.get("CameraModelName")
+            or ""
         )
 
+        meta.model = str(
+            data.get("Model")
+            or data.get("UniqueCameraModel")
+            or ""
+        )
 
-# ============================================================
-# Metadata merge
-# ============================================================
+        meta.lens_make = str(data.get("LensMake") or "")
+        meta.lens_model = str(data.get("LensModel") or "")
 
-def merge_metadata(
-    exiftool,
-    pillow,
-):
+        meta.iso = safe_float(data.get("ISO"))
+        meta.exposure_time = safe_float(data.get("ExposureTime"))
+        meta.f_number = safe_float(data.get("FNumber"))
+        meta.focal_length = safe_float(data.get("FocalLength"))
 
-    return ExifMetadata(
+        meta.white_balance = str(data.get("WhiteBalance") or "")
+        meta.color_temperature = safe_float(
+            data.get("ColorTemperature")
+        )
+        meta.color_space = str(data.get("ColorSpace") or "")
 
-        make=first_nonempty(
-            exiftool.make,
-            pillow.make,
-        ),
+        return meta
 
-        model=first_nonempty(
-            exiftool.model,
-            pillow.model,
-        ),
+    # Pillow fallback
+    data = read_pillow_exif(path)
 
-        lens_make=first_nonempty(
-            exiftool.lens_make,
-            pillow.lens_make,
-        ),
+    if data:
+        meta.source = "pillow"
 
-        lens_model=first_nonempty(
-            exiftool.lens_model,
-            pillow.lens_model,
-        ),
+        meta.make = str(data.get("Make") or "")
+        meta.model = str(data.get("Model") or "")
+        meta.lens_make = str(data.get("LensMake") or "")
+        meta.lens_model = str(data.get("LensModel") or "")
 
-        iso=(
-            exiftool.iso
-            if exiftool.iso is not None
-            else pillow.iso
-        ),
+        meta.iso = safe_float(data.get("ISOSpeedRatings"))
+        meta.exposure_time = safe_float(data.get("ExposureTime"))
+        meta.f_number = safe_float(data.get("FNumber"))
+        meta.focal_length = safe_float(data.get("FocalLength"))
 
-        exposure_time=(
-            exiftool.exposure_time
-            if exiftool.exposure_time is not None
-            else pillow.exposure_time
-        ),
-
-        f_number=(
-            exiftool.f_number
-            if exiftool.f_number is not None
-            else pillow.f_number
-        ),
-
-        focal_length=(
-            exiftool.focal_length
-            if exiftool.focal_length is not None
-            else pillow.focal_length
-        ),
-
-        white_balance=first_nonempty(
-            exiftool.white_balance,
-            pillow.white_balance,
-        ),
-
-        color_temperature=(
-            exiftool.color_temperature
-            if exiftool.color_temperature is not None
-            else pillow.color_temperature
-        ),
-
-        color_space=first_nonempty(
-            exiftool.color_space,
-            pillow.color_space,
-        ),
-
-        source=(
-            "exiftool+pillow"
-            if exiftool.source == "exiftool"
-            else pillow.source
-        ),
-    )
+    return meta
 
 
 # ============================================================
 # Camera family
 # ============================================================
 
-def normalize_camera_string(text):
-
-    text = clean_text(
-        text
-    ).lower()
-
-    replacements = [
-        ("om system", "olympus"),
-        ("olympus imaging", "olympus"),
-        ("panasonic corporation", "panasonic"),
-        ("fujifilm", "fujifilm"),
-        ("fuji photo film", "fujifilm"),
-        ("sony corporation", "sony"),
-        ("canon inc.", "canon"),
-        ("nikon corporation", "nikon"),
-        ("ricoh imaging", "ricoh"),
-    ]
-
-    for old, new in replacements:
-
-        text = text.replace(
-            old,
-            new,
-        )
-
-    return text.strip()
-
-
-def camera_family(
-    make,
-    model,
-):
-
-    text = normalize_camera_string(
-        f"{make} {model}"
-    )
+def detect_camera_family(make, model):
+    text = f"{make} {model}".lower()
 
     if "canon" in text:
         return "canon"
@@ -826,19 +512,13 @@ def camera_family(
     if "sony" in text:
         return "sony"
 
-    if (
-        "fujifilm" in text
-        or "fuji" in text
-    ):
+    if "fujifilm" in text or "fuji" in text:
         return "fujifilm"
 
-    if (
-        "panasonic" in text
-        or "lumix" in text
-    ):
+    if "panasonic" in text or "lumix" in text:
         return "panasonic"
 
-    if "olympus" in text:
+    if "olympus" in text or "om system" in text:
         return "olympus"
 
     if "leica" in text:
@@ -860,416 +540,147 @@ def camera_family(
 
 
 # ============================================================
-# RAW camera profile
+# Camera profile
 # ============================================================
 
-def build_camera_profile(
-    raw,
-    metadata,
-):
-
-    iso = (
-        int(round(metadata.iso))
-        if metadata.iso is not None
-        else 100
-    )
+def make_camera_profile(raw, meta):
+    try:
+        black = np.asarray(raw.black_level_per_channel, dtype=np.float32)
+    except Exception:
+        black = None
 
     try:
-
-        black_level = get_array(
-            raw.black_level_per_channel
-        )
-
+        white = float(raw.white_level)
     except Exception:
+        white = None
 
-        black_level = np.array(
-            [0, 0, 0],
+    try:
+        white_ch = np.asarray(
+            raw.camera_white_level_per_channel,
             dtype=np.float32,
         )
+    except Exception:
+        white_ch = None
 
     try:
-
-        white_level_per_channel = get_array(
-            raw.camera_white_level_per_channel
-        )
-
-    except Exception:
-
-        white_level_per_channel = np.array(
-            [],
+        camera_wb = np.asarray(
+            raw.camera_whitebalance,
             dtype=np.float32,
         )
+    except Exception:
+        camera_wb = None
 
     try:
-
-        white_level = float(
-            raw.white_level
-        )
-
-    except Exception:
-
-        if white_level_per_channel.size:
-
-            white_level = float(
-                np.max(
-                    white_level_per_channel
-                )
-            )
-
-        else:
-
-            white_level = 65535.0
-
-    try:
-
-        camera_wb = get_array(
-            raw.camera_whitebalance
-        )
-
-    except Exception:
-
-        camera_wb = np.array(
-            [],
+        color_matrix = np.asarray(
+            raw.color_matrix,
             dtype=np.float32,
         )
+    except Exception:
+        color_matrix = None
 
     try:
-
-        color_matrix = get_array(
-            raw.color_matrix
-        )
-
-    except Exception:
-
-        color_matrix = np.empty(
-            (0, 0),
+        rgb_xyz = np.asarray(
+            raw.rgb_xyz_matrix,
             dtype=np.float32,
         )
+    except Exception:
+        rgb_xyz = None
 
     try:
-
-        rgb_xyz_matrix = get_array(
-            raw.rgb_xyz_matrix
+        raw_pattern = np.asarray(
+            raw.raw_pattern,
         )
-
     except Exception:
-
-        rgb_xyz_matrix = np.empty(
-            (0, 0),
-            dtype=np.float32,
-        )
-
-    try:
-
-        color_desc = clean_text(
-            raw.color_desc
-        )
-
-    except Exception:
-
-        color_desc = ""
-
-    try:
-
-        num_colors = int(
-            raw.num_colors
-        )
-
-    except Exception:
-
-        num_colors = 3
-
-    try:
-
-        raw_pattern = raw.raw_pattern
-
-    except Exception:
-
         raw_pattern = None
 
     try:
-
-        raw_width = int(
-            raw.sizes.raw_width
-        )
-
-        raw_height = int(
-            raw.sizes.raw_height
-        )
-
+        desc = str(raw.color_desc)
     except Exception:
-
-        try:
-
-            h, w = (
-                raw.raw_image_visible.shape
-            )
-
-            raw_width = int(w)
-            raw_height = int(h)
-
-        except Exception:
-
-            raw_width = 0
-            raw_height = 0
+        desc = ""
 
     try:
-
-        libraw_version = str(
-            rawpy.libraw_version
-        )
-
+        num_colors = int(raw.num_colors)
     except Exception:
+        num_colors = 3
 
-        libraw_version = "unknown"
+    try:
+        width = int(raw.sizes.raw_width)
+        height = int(raw.sizes.raw_height)
+    except Exception:
+        width = 0
+        height = 0
+
+    try:
+        libraw_version = str(rawpy.libraw_version)
+    except Exception:
+        libraw_version = ""
+
+    family = detect_camera_family(meta.make, meta.model)
 
     return CameraProfile(
+        make=meta.make,
+        model=meta.model,
+        family=family,
 
-        make=metadata.make or "UNKNOWN",
+        iso=meta.iso,
 
-        model=metadata.model or "UNKNOWN",
-
-        iso=iso,
-
-        black_level=black_level,
-
-        white_level=white_level,
-
-        white_level_per_channel=
-            white_level_per_channel,
+        black_level=black,
+        white_level=white,
+        white_level_per_channel=white_ch,
 
         camera_wb=camera_wb,
 
         color_matrix=color_matrix,
+        rgb_xyz_matrix=rgb_xyz,
 
-        rgb_xyz_matrix=rgb_xyz_matrix,
-
-        color_desc=color_desc,
-
+        color_desc=desc,
         num_colors=num_colors,
 
-        raw_width=raw_width,
-
-        raw_height=raw_height,
-
+        raw_width=width,
+        raw_height=height,
         raw_pattern=raw_pattern,
 
-        lens_make=metadata.lens_make,
+        lens_make=meta.lens_make,
+        lens_model=meta.lens_model,
 
-        lens_model=metadata.lens_model,
+        exposure_time=meta.exposure_time,
+        f_number=meta.f_number,
+        focal_length=meta.focal_length,
 
-        exposure_time=metadata.exposure_time,
+        white_balance=meta.white_balance,
+        color_temperature=meta.color_temperature,
+        color_space=meta.color_space,
 
-        f_number=metadata.f_number,
-
-        focal_length=metadata.focal_length,
-
-        white_balance=metadata.white_balance,
-
-        color_temperature=
-            metadata.color_temperature,
-
-        color_space=metadata.color_space,
-
-        metadata_source=metadata.source,
-
+        metadata_source=meta.source,
         libraw_version=libraw_version,
     )
 
 
 # ============================================================
-# Camera logging
+# RAW -> Camera RGB
 # ============================================================
 
-def print_camera_profile(profile):
-
-    family = camera_family(
-        profile.make,
-        profile.model,
-    )
-
-    print()
-
-    print(
-        f"[INFO] RAW camera: "
-        f"{profile.make} "
-        f"{profile.model}"
-    )
-
-    print(
-        f"[INFO] Camera family: "
-        f"{family}"
-    )
-
-    print(
-        f"[INFO] Metadata source: "
-        f"{profile.metadata_source}"
-    )
-
-    if (
-        profile.lens_make
-        or profile.lens_model
-    ):
-
-        print(
-            f"[INFO] Lens: "
-            f"{profile.lens_make} "
-            f"{profile.lens_model}".strip()
-        )
-
-    print(
-        f"[INFO] ISO: "
-        f"{profile.iso}"
-    )
-
-    if profile.exposure_time is not None:
-
-        print(
-            "[INFO] Exposure time: "
-            f"{profile.exposure_time:.6f}s"
-        )
-
-    if profile.f_number is not None:
-
-        print(
-            "[INFO] F-number: "
-            f"f/{profile.f_number:.1f}"
-        )
-
-    if profile.focal_length is not None:
-
-        print(
-            "[INFO] Focal length: "
-            f"{profile.focal_length:.1f}mm"
-        )
-
-    if profile.white_balance:
-
-        print(
-            "[INFO] White balance: "
-            f"{profile.white_balance}"
-        )
-
-    if (
-        profile.color_temperature
-        is not None
-    ):
-
-        print(
-            "[INFO] Color temperature: "
-            f"{profile.color_temperature:.0f}K"
-        )
-
-    print(
-        f"[INFO] RAW size: "
-        f"{profile.raw_width} "
-        f"x "
-        f"{profile.raw_height}"
-    )
-
-    print(
-        f"[INFO] Number of colors: "
-        f"{profile.num_colors}"
-    )
-
-    print(
-        f"[INFO] Color description: "
-        f"{profile.color_desc}"
-    )
-
-    print(
-        f"[INFO] LibRaw: "
-        f"{profile.libraw_version}"
-    )
-
-    if profile.black_level.size:
-
-        print(
-            f"[INFO] Black level: "
-            f"{profile.black_level}"
-        )
-
-    print(
-        f"[INFO] White level: "
-        f"{profile.white_level:.1f}"
-    )
-
-    if profile.camera_wb.size:
-
-        print(
-            f"[INFO] Camera WB: "
-            f"{profile.camera_wb}"
-        )
-
-    if profile.color_matrix.size:
-
-        print(
-            "[INFO] Color Matrix:"
-        )
-
-        print(
-            profile.color_matrix
-        )
-
-    if profile.rgb_xyz_matrix.size:
-
-        print(
-            "[INFO] RGB -> XYZ Matrix:"
-        )
-
-        print(
-            profile.rgb_xyz_matrix
-        )
-
-
-# ============================================================
-# RAW -> camera RGB
-# ============================================================
-
-def load_linear_camera_rgb(path):
-
-    raw = rawpy.imread(
-        str(path)
-    )
+def develop_raw_camera_rgb(path: Path):
+    raw = rawpy.imread(str(path))
 
     rgb = raw.postprocess(
-
         use_camera_wb=True,
-
         use_auto_wb=False,
 
         output_color=rawpy.ColorSpace.raw,
-
         output_bps=16,
 
-        gamma=(1, 1),
+        gamma=(1.0, 1.0),
 
         no_auto_bright=True,
 
-        highlight_mode=
-            rawpy.HighlightMode.Blend,
+        highlight_mode=rawpy.HighlightMode.Blend,
 
         half_size=False,
-
         four_color_rgb=False,
 
-        demosaic_algorithm=
-            rawpy.DemosaicAlgorithm.AHD,
+        demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
     )
-
-    rgb = rgb.astype(
-        np.float32
-    )
-
-    max_value = float(
-        np.max(rgb)
-    )
-
-    if max_value > 1.0:
-
-        rgb /= 65535.0
-
-    rgb = clamp01(rgb)
 
     return raw, rgb
 
@@ -1278,101 +689,64 @@ def load_linear_camera_rgb(path):
 # Camera RGB -> sRGB
 # ============================================================
 
-def camera_rgb_to_srgb(
-    rgb,
-    profile,
-):
+def camera_rgb_to_srgb(camera_rgb, profile):
+    img = camera_rgb.astype(np.float32)
+
+    if img.ndim != 3:
+        raise ValueError("Invalid camera RGB image")
+
+    if img.shape[2] < 3:
+        raise ValueError("Camera RGB has less than 3 channels")
+
+    img = img[:, :, :3]
+
+    # Normalize based on actual RAW white level when possible.
+    white = profile.white_level
+
+    if white is not None and white > 0:
+        rgb = img / float(white)
+    else:
+        rgb = img / 65535.0
+
+    rgb = np.clip(rgb, 0.0, 1.0)
 
     matrix = profile.rgb_xyz_matrix
 
-    if matrix.size == 0:
-
-        print(
-            "[WARN] RGB->XYZ matrix "
-            "unavailable."
+    if matrix is None:
+        raise RuntimeError(
+            "rgb_xyz_matrix is unavailable"
         )
 
-        return clamp01(rgb)
+    matrix = np.asarray(matrix, dtype=np.float32)
 
-    matrix = np.asarray(
-        matrix,
-        dtype=np.float32,
-    )
-
-    if matrix.ndim != 2:
-        return clamp01(rgb)
-
-    if (
-        matrix.shape[0] != 3
-        or
-        matrix.shape[1] < 3
-    ):
-
-        return clamp01(rgb)
-
-    matrix = matrix[:, :3]
-
-    flat = rgb.reshape(
-        -1,
-        3,
-    )
-
-    xyz = (
-        flat
-        @
-        matrix.T
-    )
-
-    xyz_to_srgb = np.array(
-        [
-            [
-                3.2406,
-                -1.5372,
-                -0.4986,
-            ],
-            [
-                -0.9689,
-                1.8758,
-                0.0415,
-            ],
-            [
-                0.0557,
-                -0.2040,
-                1.0570,
-            ],
-        ],
-        dtype=np.float32,
-    )
-
-    srgb = (
-        xyz
-        @
-        xyz_to_srgb.T
-    )
-
-    srgb = srgb.reshape(
-        rgb.shape
-    )
-
-    srgb = np.maximum(
-        srgb,
-        0.0,
-    )
-
-    p99 = float(
-        np.percentile(
-            srgb,
-            99.5,
+    if matrix.shape[0] < 3 or matrix.shape[1] < 3:
+        raise RuntimeError(
+            f"Invalid rgb_xyz_matrix shape: {matrix.shape}"
         )
+
+    matrix = matrix[:3, :3]
+
+    flat = rgb.reshape(-1, 3)
+
+    xyz = flat @ matrix.T
+
+    srgb_linear = xyz @ XYZ_TO_SRGB.T
+
+    srgb_linear = np.maximum(srgb_linear, 0.0)
+
+    # Linear sRGB -> gamma encoded sRGB
+    srgb = np.where(
+        srgb_linear <= 0.0031308,
+        12.92 * srgb_linear,
+        1.055 * np.power(
+            np.maximum(srgb_linear, 0.0),
+            1.0 / 2.4,
+        ) - 0.055,
     )
 
-    if p99 > 1e-6:
+    srgb = srgb.reshape(rgb.shape)
 
-        srgb /= p99
-
-    return clamp01(
-        srgb
-    )
+    return np.clip(srgb, 0.0, 1.0)
 
 
 # ============================================================
@@ -1380,1004 +754,396 @@ def camera_rgb_to_srgb(
 # ============================================================
 
 def analyze_image(img):
+    gray = cv2.cvtColor(
+        (img * 255).astype(np.uint8),
+        cv2.COLOR_RGB2GRAY,
+    ).astype(np.float32) / 255.0
 
-    lum = luminance(img)
+    pixels = img.reshape(-1, 3)
 
-    mean = float(
-        np.mean(lum)
-    )
+    mean = float(np.mean(gray))
+    median = float(np.median(gray))
 
-    median = float(
-        np.median(lum)
-    )
+    p01 = float(np.percentile(gray, 1))
+    p05 = float(np.percentile(gray, 5))
+    p95 = float(np.percentile(gray, 95))
+    p99 = float(np.percentile(gray, 99))
 
-    p01, p05, p95, p99 = np.percentile(
-        lum,
-        [
-            1,
-            5,
-            95,
-            99,
-        ],
-    )
+    shadow_ratio = float(np.mean(gray < 0.08))
+    highlight_ratio = float(np.mean(gray > 0.92))
 
-    shadow_ratio = float(
-        np.mean(
-            lum < 0.05
-        )
-    )
-
-    highlight_ratio = float(
-        np.mean(
-            lum > 0.95
-        )
-    )
-
-    dynamic_range = float(
-        np.log10(
-            max(
-                float(p99),
-                1e-5,
-            )
-            /
-            max(
-                float(p01),
-                1e-5,
-            )
-        )
-    )
+    dynamic_range = p95 - p05
 
     saturation_ratio = float(
-        np.mean(
-            (
-                np.max(
-                    img,
-                    axis=2,
-                )
-                -
-                np.min(
-                    img,
-                    axis=2,
-                )
-            )
-            < 0.02
-        )
-    )
-
-    gray = (
-        clamp01(lum)
-        * 255
-    ).astype(
-        np.uint8
+        np.mean(np.max(pixels, axis=1) > 0.98)
     )
 
     edges = cv2.Canny(
-        gray,
+        (gray * 255).astype(np.uint8),
         50,
-        150,
+        120,
     )
 
-    edge_density = float(
-        np.mean(
-            edges > 0
-        )
-    )
+    edge_density = float(np.mean(edges > 0))
 
-    r = img[..., 0]
-    g = img[..., 1]
-    b = img[..., 2]
+    r = img[:, :, 0]
+    g = img[:, :, 1]
+    b = img[:, :, 2]
 
     warm_ratio = float(
-        np.mean(
-            (
-                r > b * 1.10
-            )
-            &
-            (
-                r > g * 1.03
-            )
-        )
+        np.mean((r > b * 1.12) & (r > g * 1.03))
     )
 
-    contrast = float(
-        np.std(lum)
-    )
+    contrast = float(np.std(gray))
 
-    return ImageAnalysis(
-
+    return ImageStats(
         mean=mean,
-
         median=median,
-
-        p01=float(p01),
-        p05=float(p05),
-        p95=float(p95),
-        p99=float(p99),
-
+        p01=p01,
+        p05=p05,
+        p95=p95,
+        p99=p99,
         shadow_ratio=shadow_ratio,
         highlight_ratio=highlight_ratio,
-
         dynamic_range=dynamic_range,
-
         saturation_ratio=saturation_ratio,
-
         edge_density=edge_density,
-
         warm_ratio=warm_ratio,
-
         contrast=contrast,
     )
 
 
 # ============================================================
-# Shooting condition analysis
+# Shooting condition
 # ============================================================
 
-def analyze_shooting_condition(
-    profile,
-    analysis,
-):
+def analyze_shooting_condition(profile):
+    result = ShootingCondition()
 
-    iso = max(
-        profile.iso,
-        100,
-    )
+    if profile.iso:
+        iso = profile.iso
 
-    iso_factor = clamp01(
-        math.log2(
-            iso / 100.0
-        )
-        /
-        math.log2(12800 / 100)
-    )
-
-    # --------------------------------------------------------
-    # Shutter
-    # --------------------------------------------------------
-
-    shutter = (
-        profile.exposure_time
-        if profile.exposure_time
-        is not None
-        else 1 / 125
-    )
-
-    # Longer exposure => higher motion risk.
-    if shutter >= 1.0:
-        motion_risk = 1.0
-
-    elif shutter >= 0.5:
-        motion_risk = 0.90
-
-    elif shutter >= 0.25:
-        motion_risk = 0.75
-
-    elif shutter >= 0.125:
-        motion_risk = 0.55
-
-    elif shutter >= 0.06:
-        motion_risk = 0.30
-
-    else:
-        motion_risk = 0.05
-
-    # Low-light indicator
-    low_light = clamp01(
-        (
-            0.30
-            -
-            analysis.mean
-        )
-        /
-        0.30
-    )
-
-    low_light = max(
-        low_light,
-        iso_factor * 0.7,
-    )
-
-    # --------------------------------------------------------
-    # Aperture
-    # --------------------------------------------------------
-
-    aperture = (
-        profile.f_number
-        if profile.f_number
-        is not None
-        else 5.6
-    )
-
-    shallow_dof = clamp01(
-        (
-            5.6
-            -
-            aperture
-        )
-        /
-        4.0
-    )
-
-    # --------------------------------------------------------
-    # Focal length
-    # --------------------------------------------------------
-
-    focal = (
-        profile.focal_length
-        if profile.focal_length
-        is not None
-        else 35.0
-    )
-
-    wide_angle = clamp01(
-        (
-            35.0
-            -
-            focal
-        )
-        /
-        25.0
-    )
-
-    telephoto = clamp01(
-        (
-            focal
-            -
-            70.0
-        )
-        /
-        130.0
-    )
-
-    # --------------------------------------------------------
-    # Noise estimate
-    # --------------------------------------------------------
-
-    estimated_noise = clamp01(
-        iso_factor * 0.75
-        +
-        low_light * 0.25
-    )
-
-    return ShootingCondition(
-
-        iso_factor=float(
-            iso_factor
-        ),
-
-        shutter_factor=float(
-            motion_risk
-        ),
-
-        aperture_factor=float(
-            shallow_dof
-        ),
-
-        focal_factor=float(
-            max(
-                wide_angle,
-                telephoto,
-            )
-        ),
-
-        low_light=float(
-            low_light
-        ),
-
-        motion_risk=float(
-            motion_risk
-        ),
-
-        shallow_dof=float(
-            shallow_dof
-        ),
-
-        wide_angle=float(
-            wide_angle
-        ),
-
-        telephoto=float(
-            telephoto
-        ),
-
-        estimated_noise=float(
-            estimated_noise
-        ),
-    )
-
-
-def print_shooting_condition(
-    condition,
-):
-
-    print(
-        "[INFO] Shooting condition:"
-    )
-
-    print(
-        f"  ISO factor      : "
-        f"{condition.iso_factor:.2f}"
-    )
-
-    print(
-        f"  Low light       : "
-        f"{condition.low_light:.2f}"
-    )
-
-    print(
-        f"  Motion risk     : "
-        f"{condition.motion_risk:.2f}"
-    )
-
-    print(
-        f"  Shallow DOF     : "
-        f"{condition.shallow_dof:.2f}"
-    )
-
-    print(
-        f"  Wide angle      : "
-        f"{condition.wide_angle:.2f}"
-    )
-
-    print(
-        f"  Telephoto       : "
-        f"{condition.telephoto:.2f}"
-    )
-
-    print(
-        f"  Estimated noise : "
-        f"{condition.estimated_noise:.2f}"
-    )
-
-
-# ============================================================
-# Semantic segmentation
-# ============================================================
-
-class SemanticSegmenter:
-
-    def __init__(
-        self,
-        device="cpu",
-        max_size=768,
-    ):
-
-        import torch
-        import torchvision
-
-        self.torch = torch
-
-        if (
-            device == "cuda"
-            and
-            not torch.cuda.is_available()
-        ):
-
-            device = "cpu"
-
-        self.device = torch.device(
-            device
+        result.iso_factor = clamp01(
+            (math.log2(max(iso, 100) / 100.0)) / 6.0
         )
 
-        print(
-            "[INFO] Semantic device: "
-            f"{self.device}"
+        result.estimated_noise = result.iso_factor
+
+        result.low_light = clamp01(
+            (math.log2(max(iso, 100) / 200.0)) / 5.0
         )
 
-        weights = (
-            torchvision.models
-            .segmentation
-            .DeepLabV3_MobileNet_V3_Large_Weights
-            .DEFAULT
-        )
+    if profile.exposure_time:
+        shutter = profile.exposure_time
 
-        self.model = (
-            torchvision.models
-            .segmentation
-            .deeplabv3_mobilenet_v3_large(
-                weights=weights
-            )
-        )
-
-        self.model.eval()
-
-        self.model.to(
-            self.device
-        )
-
-        self.preprocess = (
-            weights.transforms()
-        )
-
-        self.max_size = max_size
-
-    def predict(self, img):
-
-        h, w = img.shape[:2]
-
-        scale = min(
-            1.0,
-            self.max_size
-            /
-            max(h, w),
-        )
-
-        if scale < 1.0:
-
-            nw = int(
-                w * scale
+        if shutter > 0:
+            result.motion_risk = clamp01(
+                math.log2(1.0 / shutter) / 8.0
             )
 
-            nh = int(
-                h * scale
-            )
+    if profile.f_number:
+        aperture = profile.f_number
 
-            small = cv2.resize(
-                img,
-                (
-                    nw,
-                    nh,
-                ),
-                interpolation=
-                    cv2.INTER_AREA,
-            )
-
-        else:
-
-            small = img
-
-        rgb8 = (
-            clamp01(small)
-            * 255
-        ).astype(
-            np.uint8
+        result.shallow_dof = clamp01(
+            (2.8 / max(aperture, 1.0))
         )
 
-        pil = Image.fromarray(
-            rgb8
+    if profile.focal_length:
+        f = profile.focal_length
+
+        result.wide_angle = clamp01(
+            (35.0 - f) / 25.0
         )
 
-        tensor = (
-            self.preprocess(
-                pil
-            )
-            .unsqueeze(0)
-            .to(self.device)
+        result.telephoto = clamp01(
+            (f - 70.0) / 200.0
         )
 
-        with self.torch.no_grad():
-
-            output = self.model(
-                tensor
-            )["out"]
-
-            probabilities = (
-                self.torch.softmax(
-                    output,
-                    dim=1,
-                )[0]
-                .cpu()
-                .numpy()
-            )
-
-        labels = np.argmax(
-            probabilities,
-            axis=0,
-        )
-
-        confidence = np.max(
-            probabilities,
-            axis=0,
-        )
-
-        labels = cv2.resize(
-            labels.astype(
-                np.uint8
-            ),
-            (
-                w,
-                h,
-            ),
-            interpolation=
-                cv2.INTER_NEAREST,
-        )
-
-        confidence = cv2.resize(
-            confidence.astype(
-                np.float32
-            ),
-            (
-                w,
-                h,
-            ),
-            interpolation=
-                cv2.INTER_LINEAR,
-        )
-
-        return (
-            labels,
-            confidence,
-        )
+    return result
 
 
 # ============================================================
 # Saliency
 # ============================================================
 
-def calculate_saliency_map(
-    img,
-):
-
+def compute_saliency(img):
     h, w = img.shape[:2]
 
-    lum = luminance(
-        img
-    )
+    gray = cv2.cvtColor(
+        (img * 255).astype(np.uint8),
+        cv2.COLOR_RGB2GRAY,
+    ).astype(np.float32) / 255.0
 
-    local = cv2.GaussianBlur(
-        lum,
-        (0, 0),
-        9,
-    )
+    # Local luminance contrast
+    blur = cv2.GaussianBlur(gray, (0, 0), 15)
 
-    local_contrast = np.abs(
-        lum
-        -
-        local
-    )
+    local_contrast = np.abs(gray - blur)
 
-    gray = (
-        clamp01(lum)
-        * 255
-    ).astype(
-        np.uint8
-    )
+    # Edge
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
 
-    gx = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3,
-    )
+    edge = cv2.magnitude(gx, gy)
+    edge = normalize_percentile(edge)
 
-    gy = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3,
-    )
+    # Colorfulness
+    r = img[:, :, 0]
+    g = img[:, :, 1]
+    b = img[:, :, 2]
 
-    edge = np.sqrt(
-        gx * gx
-        +
-        gy * gy
-    )
+    colorfulness = np.max(img, axis=2) - np.min(img, axis=2)
+    colorfulness = normalize_percentile(colorfulness)
 
-    edge = normalize_map(
-        edge
-    )
+    # Brightness distinctiveness
+    brightness = np.abs(gray - np.mean(gray))
+    brightness = normalize_percentile(brightness)
 
-    colorfulness = (
-        np.max(
-            img,
-            axis=2,
-        )
-        -
-        np.min(
-            img,
-            axis=2,
-        )
-    )
+    # Center prior
+    yy, xx = np.mgrid[0:h, 0:w]
 
-    mean_blur = cv2.GaussianBlur(
-        lum,
-        (0, 0),
-        15,
-    )
-
-    brightness_distinct = np.abs(
-        lum
-        -
-        mean_blur
-    )
-
-    yy, xx = np.mgrid[
-        0:h,
-        0:w,
-    ]
-
-    cx = (
-        w - 1
-    ) / 2
-
-    cy = (
-        h - 1
-    ) / 2
-
-    dx = (
-        xx - cx
-    ) / max(
-        cx,
-        1,
-    )
-
-    dy = (
-        yy - cy
-    ) / max(
-        cy,
-        1,
-    )
-
-    distance = np.sqrt(
-        dx * dx
-        +
-        dy * dy
-    )
+    nx = (xx - w / 2) / (w / 2)
+    ny = (yy - h / 2) / (h / 2)
 
     center = np.exp(
-        -1.8
-        *
-        distance
-        *
-        distance
+        -(nx * nx + ny * ny) / 0.7
     )
 
     saliency = (
-
-        0.30
-        *
-        normalize_map(
-            local_contrast
-        )
-
-        +
-
-        0.25
-        *
-        edge
-
-        +
-
-        0.15
-        *
-        normalize_map(
-            colorfulness
-        )
-
-        +
-
-        0.20
-        *
-        normalize_map(
-            brightness_distinct
-        )
-
-        +
-
-        0.10
-        *
-        center
+        0.30 * normalize_percentile(local_contrast)
+        + 0.25 * edge
+        + 0.15 * colorfulness
+        + 0.20 * brightness
+        + 0.10 * center
     )
 
-    saliency = cv2.GaussianBlur(
-        saliency.astype(
-            np.float32
-        ),
-        (0, 0),
-        3,
-    )
-
-    return normalize_map(
-        saliency
-    )
+    return normalize_percentile(saliency)
 
 
 # ============================================================
-# Subject ranking
+# Semantic segmentation
 # ============================================================
 
-def class_prior(
-    class_name,
-):
+class Segmenter:
 
-    if class_name == "person":
-        return 1.15
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.model = None
 
-    if class_name in ANIMAL_CLASSES:
-        return 1.05
-
-    if class_name in VEHICLE_CLASSES:
-        return 1.00
-
-    if class_name == "pottedplant":
-        return 0.90
-
-    if class_name == "bottle":
-        return 0.85
-
-    return 1.0
-
-
-def calculate_subjects(
-    labels,
-    confidence,
-    saliency,
-    img,
-):
-
-    h, w = labels.shape
-
-    yy, xx = np.mgrid[
-        0:h,
-        0:w,
-    ]
-
-    center = np.exp(
-        -1.8
-        *
-        (
-            (
-                (xx - (w - 1) / 2)
-                /
-                max((w - 1) / 2, 1)
-            ) ** 2
-            +
-            (
-                (yy - (h - 1) / 2)
-                /
-                max((h - 1) / 2, 1)
-            ) ** 2
-        )
-    )
-
-    lum = luminance(
-        img
-    )
-
-    local_blur = cv2.GaussianBlur(
-        lum,
-        (0, 0),
-        15,
-    )
-
-    results = []
-
-    for class_id, class_name in enumerate(
-        VOC_CLASSES
-    ):
-
-        if class_name not in SUBJECT_CLASSES:
-            continue
-
-        mask = (
-            labels == class_id
-        )
-
-        if not np.any(mask):
-            continue
-
-        confidence_mean = float(
-            np.mean(
-                confidence[mask]
+        if torch is None or torchvision is None:
+            print(
+                "[WARN] PyTorch/torchvision unavailable. "
+                "Segmentation disabled."
             )
+            return
+
+        try:
+            self.model = (
+                torchvision.models.segmentation
+                .deeplabv3_mobilenet_v3_large(
+                    weights="DEFAULT"
+                )
+            )
+
+            self.model.eval()
+            self.model.to(device)
+
+            print(
+                f"[INFO] Semantic segmentation: "
+                f"DeepLabV3 MobileNet V3 Large ({device})"
+            )
+
+        except Exception as e:
+            print(
+                f"[WARN] Failed to load segmentation model: {e}"
+            )
+
+            self.model = None
+
+    def predict(self, img):
+        if self.model is None:
+            return None, None
+
+        original_h, original_w = img.shape[:2]
+
+        small = resize_for_analysis(
+            img,
+            max_size=768,
         )
 
-        if confidence_mean < 0.35:
+        tensor = TF.to_tensor(small)
+
+        tensor = tensor.unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            output = self.model(tensor)["out"]
+
+        prediction = output.argmax(1)[0]
+
+        prediction = prediction.cpu().numpy()
+
+        prediction = cv2.resize(
+            prediction.astype(np.uint8),
+            (original_w, original_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        confidence = torch.softmax(
+            output,
+            dim=1,
+        ).max(1)[0][0]
+
+        confidence = confidence.cpu().numpy()
+
+        confidence = cv2.resize(
+            confidence.astype(np.float32),
+            (original_w, original_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        return prediction, confidence
+
+
+# ============================================================
+# Subject candidates
+# ============================================================
+
+def rank_subjects(img, segmentation, confidence, saliency):
+    if segmentation is None:
+        return []
+
+    h, w = img.shape[:2]
+
+    subjects = []
+
+    for class_name, class_weight in SUBJECT_CLASSES.items():
+
+        class_id = CLASS_ID.get(class_name)
+
+        if class_id is None:
             continue
 
-        area = float(
-            np.mean(mask)
-        )
+        mask = segmentation == class_id
 
-        ys, xs = np.where(
-            mask
-        )
+        area = float(np.mean(mask))
 
-        if len(xs) == 0:
+        if area < 0.002:
             continue
 
-        cy = int(
-            np.mean(ys)
+        conf = float(np.mean(confidence[mask]))
+
+        if np.sum(mask) == 0:
+            continue
+
+        ys, xs = np.where(mask)
+
+        cx = np.mean(xs) / w
+        cy = np.mean(ys) / h
+
+        center_distance = math.sqrt(
+            (cx - 0.5) ** 2
+            + (cy - 0.5) ** 2
         )
 
-        cx = int(
-            np.mean(xs)
+        center_score = clamp01(
+            1.0 - center_distance / 0.707
         )
 
-        center_score = float(
-            center[
-                cy,
-                cx,
-            ]
-        )
+        sal = float(np.mean(saliency[mask]))
 
-        saliency_score = float(
+        region = img[mask]
+
+        colorfulness = float(
             np.mean(
-                saliency[mask]
+                np.max(region, axis=1)
+                - np.min(region, axis=1)
             )
         )
 
         local_contrast = float(
-            np.mean(
-                np.abs(
-                    lum[mask]
-                    -
-                    local_blur[mask]
-                )
-            )
-        )
-
-        pixels = img[mask]
-
-        colorfulness = float(
-            np.mean(
-                np.max(
-                    pixels,
-                    axis=1,
-                )
-                -
-                np.min(
-                    pixels,
-                    axis=1,
-                )
-            )
-        )
-
-        area_score = min(
-            math.sqrt(
-                area * 20
-            ),
-            1.0,
-        )
-
-        local_contrast_score = min(
-            local_contrast / 0.15,
-            1.0,
+            np.std(
+                cv2.cvtColor(
+                    (img * 255).astype(np.uint8),
+                    cv2.COLOR_RGB2GRAY,
+                )[mask]
+            ) / 255.0
         )
 
         score = (
-
-            confidence_mean
-
-            *
-
-            (
-                0.25
-                * area_score
-
-                +
-
-                0.20
-                * center_score
-
-                +
-
-                0.25
-                * saliency_score
-
-                +
-
-                0.15
-                * local_contrast_score
-
-                +
-
-                0.15
-                * colorfulness
-            )
-
-            *
-
-            class_prior(
-                class_name
+            class_weight
+            * (
+                0.35 * conf
+                + 0.20 * center_score
+                + 0.25 * sal
+                + 0.10 * clamp01(local_contrast * 3)
+                + 0.10 * clamp01(colorfulness * 3)
             )
         )
 
-        results.append(
+        subjects.append(
             SubjectCandidate(
-
                 class_name=class_name,
-
-                confidence=
-                    confidence_mean,
-
+                confidence=conf,
                 area=area,
-
-                center_score=
-                    center_score,
-
-                saliency_score=
-                    saliency_score,
-
-                local_contrast=
-                    local_contrast,
-
-                colorfulness=
-                    colorfulness,
-
-                score=float(score),
+                center_score=center_score,
+                saliency=sal,
+                local_contrast=local_contrast,
+                colorfulness=colorfulness,
+                score=score,
+                mask=mask,
             )
         )
 
-    results.sort(
+    subjects.sort(
         key=lambda x: x.score,
         reverse=True,
     )
 
-    return results
+    return subjects
 
 
 # ============================================================
 # Scene classification
 # ============================================================
 
-def classify_scene(
-    analysis,
-    subjects,
-    condition,
-):
+def classify_scene(stats, profile, segmentation):
+    h, w = segmentation.shape if segmentation is not None else (1, 1)
 
-    if (
-        analysis.mean < 0.12
-        or
-        condition.low_light > 0.75
+    if segmentation is not None:
+        person_id = CLASS_ID["person"]
+
+        person_ratio = float(
+            np.mean(segmentation == person_id)
+        )
+    else:
+        person_ratio = 0.0
+
+    if profile.exposure_time:
+        slow_shutter = profile.exposure_time > 1 / 20
+    else:
+        slow_shutter = False
+
+    if stats.mean < 0.22 and (
+        stats.shadow_ratio > 0.25
+        or slow_shutter
     ):
-
         return "night"
 
-    if (
-        analysis.warm_ratio > 0.28
-        and
-        analysis.highlight_ratio > 0.03
-    ):
+    if person_ratio > 0.02:
+        return "portrait"
 
+    if (
+        stats.warm_ratio > 0.22
+        and stats.highlight_ratio > 0.015
+    ):
         return "sunset"
 
-    has_person = any(
-        s.class_name == "person"
-        for s in subjects[:5]
-    )
-
-    if (
-        has_person
-        and
-        analysis.edge_density < 0.15
-    ):
-
-        return "portrait"
-
-    if (
-        condition.telephoto > 0.6
-        and
-        has_person
-    ):
-
-        return "portrait"
-
-    if (
-        analysis.edge_density > 0.18
-        and
-        analysis.mean > 0.30
-    ):
-
+    if stats.edge_density > 0.16:
         return "city"
 
-    if (
-        analysis.dynamic_range > 1.0
-        and
-        analysis.edge_density < 0.16
-    ):
-
+    if stats.dynamic_range > 0.55:
         return "landscape"
 
-    if (
-        analysis.mean > 0.55
-        and
-        condition.low_light < 0.3
-    ):
-
+    if stats.mean < 0.30:
         return "indoor"
 
     return "general"
@@ -2388,14 +1154,12 @@ def classify_scene(
 # ============================================================
 
 SCENE_PROFILES = {
-
     "portrait": SceneProfile(
-        name="portrait",
         exposure=0.05,
         contrast=1.02,
         saturation=0.97,
-        highlight=0.35,
-        shadow=0.08,
+        highlight_protection=0.40,
+        shadow_lift=0.08,
         subject_strength=0.08,
         background_suppression=0.035,
         denoise=0.55,
@@ -2403,12 +1167,11 @@ SCENE_PROFILES = {
     ),
 
     "night": SceneProfile(
-        name="night",
         exposure=0.00,
         contrast=1.05,
         saturation=1.03,
-        highlight=0.55,
-        shadow=0.02,
+        highlight_protection=0.55,
+        shadow_lift=0.02,
         subject_strength=0.05,
         background_suppression=0.015,
         denoise=0.85,
@@ -2416,12 +1179,11 @@ SCENE_PROFILES = {
     ),
 
     "sunset": SceneProfile(
-        name="sunset",
         exposure=-0.05,
         contrast=1.06,
         saturation=1.08,
-        highlight=0.55,
-        shadow=0.04,
+        highlight_protection=0.55,
+        shadow_lift=0.04,
         subject_strength=0.05,
         background_suppression=0.015,
         denoise=0.30,
@@ -2429,12 +1191,11 @@ SCENE_PROFILES = {
     ),
 
     "landscape": SceneProfile(
-        name="landscape",
         exposure=0.03,
         contrast=1.08,
         saturation=1.04,
-        highlight=0.40,
-        shadow=0.08,
+        highlight_protection=0.40,
+        shadow_lift=0.08,
         subject_strength=0.06,
         background_suppression=0.015,
         denoise=0.30,
@@ -2442,25 +1203,23 @@ SCENE_PROFILES = {
     ),
 
     "city": SceneProfile(
-        name="city",
         exposure=0.02,
         contrast=1.07,
         saturation=1.02,
-        highlight=0.45,
-        shadow=0.05,
+        highlight_protection=0.45,
+        shadow_lift=0.05,
         subject_strength=0.06,
-        background_suppression=0.02,
+        background_suppression=0.020,
         denoise=0.40,
         sharpen=0.80,
     ),
 
     "indoor": SceneProfile(
-        name="indoor",
         exposure=0.04,
         contrast=1.03,
         saturation=0.99,
-        highlight=0.40,
-        shadow=0.08,
+        highlight_protection=0.40,
+        shadow_lift=0.08,
         subject_strength=0.05,
         background_suppression=0.015,
         denoise=0.50,
@@ -2468,12 +1227,11 @@ SCENE_PROFILES = {
     ),
 
     "general": SceneProfile(
-        name="general",
         exposure=0.00,
         contrast=1.04,
         saturation=1.00,
-        highlight=0.35,
-        shadow=0.06,
+        highlight_protection=0.35,
+        shadow_lift=0.06,
         subject_strength=0.04,
         background_suppression=0.015,
         denoise=0.30,
@@ -2483,1415 +1241,1356 @@ SCENE_PROFILES = {
 
 
 # ============================================================
-# Camera adjustment
+# Automatic global optimization
 # ============================================================
 
-def camera_adjustment(
-    profile,
-):
+def score_global_candidate(img):
+    stats = analyze_image(img)
 
-    family = camera_family(
-        profile.make,
-        profile.model,
+    target_mean = 0.46
+
+    exposure_score = abs(
+        stats.mean - target_mean
     )
 
-    text = normalize_camera_string(
-        f"{profile.make} {profile.model}"
+    saturation_penalty = max(
+        0.0,
+        stats.saturation_ratio - 0.035,
     )
 
-    exposure = 0.0
-    contrast = 1.0
-    saturation = 1.0
-
-    if family == "canon":
-
-        contrast = 1.005
-
-    elif family == "nikon":
-
-        saturation = 0.995
-
-    elif family == "sony":
-
-        contrast = 1.005
-
-    elif family == "fujifilm":
-
-        saturation = 1.005
-
-    elif family == "panasonic":
-
-        contrast = 1.003
-
-    elif family == "olympus":
-
-        saturation = 1.005
-
-    # Conservative model-level corrections.
-    if "a7r" in text:
-
-        contrast += 0.003
-
-    if (
-        "z8" in text
-        or
-        "z9" in text
-    ):
-
-        contrast += 0.003
-
-    if (
-        "r5" in text
-        or
-        "r6" in text
-    ):
-
-        saturation += 0.003
-
-    return (
-        exposure,
-        contrast,
-        saturation,
+    shadow_penalty = max(
+        0.0,
+        stats.shadow_ratio - 0.35,
     )
 
+    highlight_penalty = max(
+        0.0,
+        stats.highlight_ratio - 0.025,
+    )
 
-# ============================================================
-# Color temperature adjustment
-# ============================================================
+    contrast_score = abs(
+        stats.contrast - 0.22
+    )
 
-def color_temperature_adjustment(
+    score = (
+        1.00 * exposure_score
+        + 1.30 * saturation_penalty
+        + 0.50 * shadow_penalty
+        + 1.20 * highlight_penalty
+        + 0.25 * contrast_score
+    )
+
+    return score
+
+
+def apply_global_candidate(
     img,
-    profile,
-):
-
-    cct = profile.color_temperature
-
-    if cct is None:
-        return img
-
-    # Very conservative correction.
-    #
-    # Camera WB is already applied by LibRaw.
-    # Therefore this is NOT a WB replacement.
-    # It is only a small rendering correction.
-
-    if cct < 3000:
-
-        # Avoid excessive blue cast.
-        red_gain = 1.005
-        blue_gain = 0.995
-
-    elif cct < 4000:
-
-        red_gain = 1.003
-        blue_gain = 0.998
-
-    elif cct > 7000:
-
-        red_gain = 0.997
-        blue_gain = 1.003
-
-    elif cct > 6000:
-
-        red_gain = 0.999
-        blue_gain = 1.002
-
-    else:
-
-        red_gain = 1.0
-        blue_gain = 1.0
-
-    result = img.copy()
-
-    result[..., 0] *= red_gain
-    result[..., 2] *= blue_gain
-
-    return clamp01(
-        result
-    )
-
-
-# ============================================================
-# Tone
-# ============================================================
-
-def apply_exposure(
-    img,
-    ev,
-):
-
-    gain = 2.0 ** ev
-
-    return clamp01(
-        img * gain
-    )
-
-
-def apply_contrast(
-    img,
+    exposure,
     contrast,
-):
-
-    return clamp01(
-        (
-            img
-            -
-            0.5
-        )
-        *
-        contrast
-        +
-        0.5
-    )
-
-
-def apply_saturation(
-    img,
     saturation,
 ):
+    out = img.copy()
 
-    lum = luminance(
-        img
-    )[..., None]
+    out *= 2.0 ** exposure
 
-    return clamp01(
-        lum
-        +
-        (
-            img
-            -
-            lum
-        )
-        *
-        saturation
+    out = np.clip(out, 0.0, 1.0)
+
+    gray = cv2.cvtColor(
+        (out * 255).astype(np.uint8),
+        cv2.COLOR_RGB2GRAY,
+    ).astype(np.float32) / 255.0
+
+    out = (
+        (out - 0.5) * contrast
+        + 0.5
     )
 
+    hsv = cv2.cvtColor(
+        (np.clip(out, 0, 1) * 255).astype(np.uint8),
+        cv2.COLOR_RGB2HSV,
+    ).astype(np.float32)
 
-# ============================================================
-# RAW level based highlight/shadow
-# ============================================================
+    hsv[:, :, 1] *= saturation
 
-def calculate_raw_headroom(
-    profile,
-):
-
-    if (
-        profile.black_level.size == 0
-        or
-        profile.white_level <= 0
-    ):
-
-        return 0.5
-
-    black = float(
-        np.mean(
-            profile.black_level
-        )
+    hsv[:, :, 1] = np.clip(
+        hsv[:, :, 1],
+        0,
+        255,
     )
 
-    white = float(
-        profile.white_level
-    )
+    out = cv2.cvtColor(
+        hsv.astype(np.uint8),
+        cv2.COLOR_HSV2RGB,
+    ).astype(np.float32) / 255.0
 
-    if white <= black:
-
-        return 0.5
-
-    headroom = (
-        white
-        -
-        black
-    ) / white
-
-    return float(
-        clamp01(headroom)
-    )
+    return np.clip(out, 0.0, 1.0)
 
 
-def apply_tone_protection(
-    img,
-    profile,
-    highlight_strength,
-    shadow_strength,
-):
+def optimize_global(img, scene_profile):
+    best_score = float("inf")
+    best = None
 
-    lum = luminance(
-        img
-    )
-
-    headroom = calculate_raw_headroom(
-        profile
-    )
-
-    # More RAW headroom -> stronger highlight preservation.
-    highlight_strength *= (
-        0.8
-        +
-        0.4 * headroom
-    )
-
-    highlight = np.clip(
-        (
-            lum
-            -
-            0.65
-        )
-        /
-        0.35,
-        0.0,
-        1.0,
-    )
-
-    highlight_compress = (
-        highlight ** 1.5
-    ) * highlight_strength
-
-    img = (
-        img
-        -
-        highlight_compress[
-            ...,
-            None,
-        ]
-        *
-        0.10
-    )
-
-    shadow = np.clip(
-        (
-            0.30
-            -
-            lum
-        )
-        /
+    exposures = [
+        -0.30,
+        -0.20,
+        -0.10,
+        0.00,
+        0.10,
+        0.20,
         0.30,
+    ]
+
+    contrasts = [
+        0.96,
+        1.00,
+        1.03,
+        1.06,
+        1.09,
+    ]
+
+    saturations = [
+        0.96,
+        0.99,
+        1.00,
+        1.03,
+        1.06,
+    ]
+
+    for ev in exposures:
+        for contrast in contrasts:
+            for saturation in saturations:
+
+                ev2 = ev + scene_profile.exposure
+                c2 = contrast * scene_profile.contrast
+                s2 = saturation * scene_profile.saturation
+
+                candidate = apply_global_candidate(
+                    img,
+                    ev2,
+                    c2,
+                    s2,
+                )
+
+                score = score_global_candidate(
+                    candidate
+                )
+
+                if score < best_score:
+                    best_score = score
+
+                    best = (
+                        ev2,
+                        c2,
+                        s2,
+                        candidate,
+                    )
+
+    return best
+
+
+# ============================================================
+# Region masks
+# ============================================================
+
+def build_region_masks(
+    img,
+    segmentation,
+    subjects,
+):
+    h, w = img.shape[:2]
+
+    masks = {}
+
+    if segmentation is None:
+        masks["background"] = np.ones(
+            (h, w),
+            dtype=np.float32,
+        )
+
+        return masks
+
+    # Person
+    person_mask = (
+        segmentation == CLASS_ID["person"]
+    ).astype(np.float32)
+
+    masks["person"] = person_mask
+
+    # Vehicles
+    vehicle_ids = [
+        CLASS_ID[x]
+        for x in (
+            "car",
+            "bus",
+            "motorbike",
+            "bicycle",
+            "train",
+            "boat",
+        )
+    ]
+
+    vehicle_mask = np.isin(
+        segmentation,
+        vehicle_ids,
+    ).astype(np.float32)
+
+    masks["vehicle"] = vehicle_mask
+
+    # Vegetation
+    vegetation_mask = (
+        segmentation
+        == CLASS_ID["pottedplant"]
+    ).astype(np.float32)
+
+    masks["vegetation"] = vegetation_mask
+
+    # Sky estimation
+    #
+    # VOC DeepLab does not have a sky class.
+    # Estimate upper image blue/cyan regions.
+    r = img[:, :, 0]
+    g = img[:, :, 1]
+    b = img[:, :, 2]
+
+    yy = np.arange(h)[:, None] / max(h - 1, 1)
+
+    upper_prior = np.clip(
+        1.0 - yy * 1.8,
         0.0,
         1.0,
     )
 
-    shadow_lift = (
-        shadow ** 1.4
-    ) * shadow_strength
-
-    img = (
-        img
-        +
-        shadow_lift[
-            ...,
-            None,
-        ]
-        *
-        0.08
+    blue_score = (
+        b - 0.5 * r - 0.2 * g
     )
 
-    return clamp01(
-        img
+    sky_mask = (
+        (blue_score > 0.03)
+        & (upper_prior > 0.15)
+    ).astype(np.float32)
+
+    sky_mask *= upper_prior
+
+    masks["sky"] = sky_mask
+
+    # Water estimation
+    #
+    # Blue/cyan regions in lower/middle part.
+    water_color = (
+        b - 0.55 * r
+        - 0.15 * g
     )
 
-
-# ============================================================
-# CLAHE
-# ============================================================
-
-def apply_clahe(
-    img,
-    strength=0.5,
-):
-
-    if strength <= 0:
-        return img
-
-    lab = cv2.cvtColor(
-        (
-            clamp01(img)
-            * 255
-        ).astype(
-            np.uint8
-        ),
-        cv2.COLOR_RGB2LAB,
+    lower_prior = np.clip(
+        (yy - 0.25) / 0.75,
+        0.0,
+        1.0,
     )
 
-    l, a, b = cv2.split(
-        lab
-    )
+    water_mask = (
+        (water_color > 0.025)
+        & (lower_prior > 0.15)
+    ).astype(np.float32)
 
-    clahe = cv2.createCLAHE(
-        clipLimit=
-            1.5
-            +
-            strength * 1.5,
+    masks["water"] = water_mask * lower_prior
 
-        tileGridSize=(
-            8,
-            8,
-        ),
-    )
+    # Building estimation:
+    #
+    # Semantic classes do not contain "building".
+    # Use non-natural high-edge regions.
+    gray = cv2.cvtColor(
+        (img * 255).astype(np.uint8),
+        cv2.COLOR_RGB2GRAY,
+    ).astype(np.float32) / 255.0
 
-    l2 = clahe.apply(
-        l
-    )
+    edge = cv2.Canny(
+        (gray * 255).astype(np.uint8),
+        70,
+        140,
+    ).astype(np.float32) / 255.0
 
-    lab2 = cv2.merge(
-        [
-            l2,
-            a,
-            b,
-        ]
-    )
-
-    result = cv2.cvtColor(
-        lab2,
-        cv2.COLOR_LAB2RGB,
-    )
-
-    return (
-        result.astype(
-            np.float32
-        )
-        /
-        255.0
-    )
-
-
-# ============================================================
-# Local subject
-# ============================================================
-
-def apply_local_subject(
-    img,
-    labels,
-    subjects,
-    profile,
-    condition,
-):
-
-    if not subjects:
-        return img
-
-    best = subjects[0]
-
-    class_id = VOC_CLASSES.index(
-        best.class_name
-    )
-
-    mask = (
-        labels == class_id
-    ).astype(
-        np.float32
-    )
-
-    if np.mean(mask) < 0.002:
-        return img
-
-    mask = cv2.GaussianBlur(
-        mask,
+    building_mask = cv2.GaussianBlur(
+        edge,
         (0, 0),
-        9,
+        5,
     )
 
-    mask = clamp01(
-        mask
+    building_mask = np.clip(
+        building_mask * 2.0,
+        0,
+        1,
     )
 
-    strength = (
-        profile.subject_strength
-    )
-
-    # Stronger subject emphasis for
-    # shallow depth-of-field shots.
-    strength *= (
+    building_mask *= (
         1.0
-        +
-        condition.shallow_dof
-        *
-        0.5
+        - masks["sky"]
     )
 
-    foreground = (
+    masks["building"] = building_mask
+
+    # Subject
+    subject_mask = np.zeros(
+        (h, w),
+        dtype=np.float32,
+    )
+
+    for s in subjects[:3]:
+        if s.mask is not None:
+            strength = clamp01(
+                s.score * 1.5
+            )
+
+            subject_mask = np.maximum(
+                subject_mask,
+                s.mask.astype(np.float32)
+                * strength,
+            )
+
+    masks["subject"] = subject_mask
+
+    # Background
+    occupied = np.zeros(
+        (h, w),
+        dtype=np.float32,
+    )
+
+    for key in (
+        "person",
+        "vehicle",
+        "vegetation",
+        "sky",
+        "water",
+        "subject",
+    ):
+        occupied = np.maximum(
+            occupied,
+            masks[key],
+        )
+
+    background = 1.0 - occupied
+
+    masks["background"] = np.clip(
+        background,
+        0,
+        1,
+    )
+
+    # Smooth masks
+    for key, mask in masks.items():
+
+        mask = cv2.GaussianBlur(
+            mask.astype(np.float32),
+            (0, 0),
+            3,
+        )
+
+        masks[key] = np.clip(
+            mask,
+            0,
+            1,
+        )
+
+    return masks
+
+
+# ============================================================
+# Region profiles
+# ============================================================
+
+def make_region_profiles(
+    scene,
+    stats,
+    shooting,
+):
+    profiles = {}
+
+    # Sky
+    profiles["sky"] = RegionProfile(
+        exposure=-0.02,
+        contrast=1.01,
+        saturation=0.99,
+        highlight_protection=0.15,
+        shadow_lift=0.00,
+        clarity=0.04,
+        denoise=0.05,
+    )
+
+    # Person
+    profiles["person"] = RegionProfile(
+        exposure=0.02,
+        contrast=0.98,
+        saturation=0.97,
+        highlight_protection=0.08,
+        shadow_lift=0.04,
+        clarity=0.01,
+        denoise=0.08,
+    )
+
+    # Vegetation
+    profiles["vegetation"] = RegionProfile(
+        exposure=0.01,
+        contrast=1.02,
+        saturation=1.04,
+        highlight_protection=0.04,
+        shadow_lift=0.01,
+        clarity=0.04,
+        denoise=0.02,
+    )
+
+    # Building
+    profiles["building"] = RegionProfile(
+        exposure=0.00,
+        contrast=1.05,
+        saturation=0.99,
+        highlight_protection=0.05,
+        shadow_lift=0.02,
+        clarity=0.07,
+        denoise=0.02,
+    )
+
+    # Water
+    profiles["water"] = RegionProfile(
+        exposure=0.00,
+        contrast=1.02,
+        saturation=1.02,
+        highlight_protection=0.10,
+        shadow_lift=0.02,
+        clarity=0.03,
+        denoise=0.04,
+    )
+
+    # Vehicle
+    profiles["vehicle"] = RegionProfile(
+        exposure=0.01,
+        contrast=1.04,
+        saturation=1.01,
+        highlight_protection=0.07,
+        shadow_lift=0.02,
+        clarity=0.05,
+        denoise=0.03,
+    )
+
+    # Background
+    profiles["background"] = RegionProfile(
+        exposure=-0.01,
+        contrast=0.99,
+        saturation=0.98,
+        highlight_protection=0.02,
+        shadow_lift=0.00,
+        clarity=-0.02,
+        denoise=0.05,
+    )
+
+    # Scene-dependent adjustments
+
+    if scene == "portrait":
+        profiles["person"].saturation *= 0.98
+        profiles["person"].contrast *= 0.99
+
+    elif scene == "night":
+        profiles["sky"].highlight_protection += 0.08
+        profiles["background"].denoise += 0.10
+
+    elif scene == "sunset":
+        profiles["sky"].highlight_protection += 0.10
+        profiles["sky"].saturation *= 0.98
+
+    elif scene == "landscape":
+        profiles["vegetation"].clarity += 0.02
+        profiles["water"].highlight_protection += 0.05
+
+    # High ISO
+    if shooting.estimated_noise > 0.55:
+        for profile in profiles.values():
+            profile.denoise += (
+                0.10
+                * shooting.estimated_noise
+            )
+
+            profile.clarity *= 0.75
+
+    return profiles
+
+
+# ============================================================
+# Region adjustment
+# ============================================================
+
+def apply_region_adjustment(
+    img,
+    mask,
+    profile,
+    raw_headroom,
+):
+    if np.max(mask) < 1e-5:
+        return img
+
+    out = img.copy()
+
+    # Exposure
+    exposure = profile.exposure
+
+    out *= (
+        2.0 ** (
+            exposure * mask[:, :, None]
+        )
+    )
+
+    # Contrast
+    local_gray = cv2.cvtColor(
+        np.clip(out, 0, 1).astype(np.float32),
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    centered = (
+        out
+        - local_gray[:, :, None]
+    )
+
+    out = (
+        local_gray[:, :, None]
+        + centered
+        * (
+            1.0
+            + (
+                profile.contrast - 1.0
+            )
+            * mask[:, :, None]
+        )
+    )
+
+    # Saturation
+    hsv = cv2.cvtColor(
+        np.clip(out, 0, 1).astype(np.float32),
+        cv2.COLOR_RGB2HSV,
+    )
+
+    hsv[:, :, 1] *= (
         1.0
-        +
-        strength
+        + (
+            profile.saturation - 1.0
+        )
         * mask
     )
 
-    result = clamp01(
-        img
-        *
-        foreground[
-            ...,
-            None,
-        ]
+    hsv[:, :, 1] = np.clip(
+        hsv[:, :, 1],
+        0,
+        1,
     )
 
-    if (
-        profile.background_suppression
-        > 0
-    ):
+    out = cv2.cvtColor(
+        hsv,
+        cv2.COLOR_HSV2RGB,
+    )
 
-        suppression = (
-            1.0
-            -
-            profile.background_suppression
-            *
-            (
-                1.0
-                -
-                mask
-            )
+    # Highlight protection
+    luminance = cv2.cvtColor(
+        np.clip(out, 0, 1).astype(np.float32),
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    highlight = np.clip(
+        (luminance - 0.65) / 0.35,
+        0,
+        1,
+    )
+
+    protection = (
+        profile.highlight_protection
+        * (0.5 + 0.5 * raw_headroom)
+        * highlight
+        * mask
+    )
+
+    out *= (
+        1.0
+        - protection[:, :, None]
+    )
+
+    # Shadow lift
+    shadow = np.clip(
+        (0.35 - luminance) / 0.35,
+        0,
+        1,
+    )
+
+    lift = (
+        profile.shadow_lift
+        * shadow
+        * mask
+    )
+
+    out += lift[:, :, None]
+
+    # Clarity
+    if abs(profile.clarity) > 1e-5:
+
+        blur = cv2.GaussianBlur(
+            luminance,
+            (0, 0),
+            7,
         )
 
-        result = clamp01(
-            result
-            *
-            suppression[
-                ...,
-                None,
-            ]
+        detail = (
+            luminance
+            - blur
         )
 
-    return result
+        out += (
+            profile.clarity
+            * detail[:, :, None]
+            * mask[:, :, None]
+        )
+
+    return np.clip(out, 0.0, 1.0)
+
+
+# ============================================================
+# Tone mapping
+# ============================================================
+
+def luminance_tone_map(
+    img,
+    highlight_protection,
+    shadow_lift,
+):
+    out = img.copy()
+
+    y = cv2.cvtColor(
+        out.astype(np.float32),
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    # Shadow lift
+    shadow = np.clip(
+        (0.35 - y) / 0.35,
+        0,
+        1,
+    )
+
+    y2 = y + shadow * shadow_lift
+
+    # Highlight compression
+    highlight = np.clip(
+        (y2 - 0.65) / 0.35,
+        0,
+        1,
+    )
+
+    compression = (
+        highlight
+        * highlight_protection
+        * 0.20
+    )
+
+    y2 = y2 * (
+        1.0 - compression
+    )
+
+    # Smooth S curve
+    y2 = np.clip(y2, 0, 1)
+
+    y2 = (
+        y2
+        * y2
+        * (3.0 - 2.0 * y2)
+    )
+
+    ratio = (
+        y2
+        / np.maximum(y, 1e-4)
+    )
+
+    out *= ratio[:, :, None]
+
+    return np.clip(out, 0, 1)
 
 
 # ============================================================
 # Denoise
 # ============================================================
 
-def apply_denoise(
-    img,
-    strength,
-):
+def denoise_image(img, strength):
+    strength = float(np.clip(strength, 0, 1))
 
-    if strength <= 0:
+    if strength <= 0.001:
         return img
 
-    img8 = (
-        clamp01(img)
-        * 255
-    ).astype(
-        np.uint8
-    )
-
     sigma_color = (
-        15.0
-        +
-        35.0 * strength
+        0.015
+        + 0.08 * strength
     )
 
     sigma_space = (
         3.0
-        +
-        4.0 * strength
+        + 5.0 * strength
     )
 
-    result = cv2.bilateralFilter(
-        img8,
-        d=7,
+    out = cv2.bilateralFilter(
+        img.astype(np.float32),
+        d=0,
         sigmaColor=sigma_color,
         sigmaSpace=sigma_space,
     )
 
-    return (
-        result.astype(
-            np.float32
-        )
-        /
-        255.0
-    )
+    return np.clip(out, 0, 1)
 
 
 # ============================================================
 # Sharpen
 # ============================================================
 
-def apply_sharpen(
-    img,
-    strength,
-):
+def sharpen_image(img, strength):
+    strength = float(np.clip(strength, 0, 1))
 
-    if strength <= 0:
+    if strength <= 0.001:
         return img
 
     blur = cv2.GaussianBlur(
         img,
         (0, 0),
-        1.2,
+        1.1,
     )
 
-    amount = (
-        0.25
-        +
-        0.85 * strength
-    )
+    detail = img - blur
 
-    result = (
+    out = (
         img
-        +
-        amount
-        *
-        (
-            img
-            -
-            blur
+        + detail * (
+            0.35
+            + 0.75 * strength
         )
     )
 
-    return clamp01(
-        result
-    )
+    return np.clip(out, 0, 1)
 
 
 # ============================================================
-# Automatic parameter search
+# Final local subject emphasis
 # ============================================================
 
-def evaluate_candidate(
+def apply_subject_emphasis(
     img,
-    analysis,
-    condition,
-):
-
-    lum = luminance(
-        img
-    )
-
-    mean = float(
-        np.mean(lum)
-    )
-
-    shadow = float(
-        np.mean(
-            lum < 0.04
-        )
-    )
-
-    highlight = float(
-        np.mean(
-            lum > 0.98
-        )
-    )
-
-    contrast = float(
-        np.std(lum)
-    )
-
-    exposure_score = 1.0 - min(
-        abs(
-            mean
-            -
-            0.46
-        )
-        /
-        0.46,
-        1.0,
-    )
-
-    clipping_penalty = (
-        shadow * 1.5
-        +
-        highlight * 2.0
-    )
-
-    contrast_score = min(
-        contrast / 0.25,
-        1.0,
-    )
-
-    score = (
-
-        exposure_score
-        * 0.45
-
-        +
-
-        contrast_score
-        * 0.30
-
-        -
-
-        clipping_penalty
-        * 0.20
-    )
-
-    # --------------------------------------------------------
-    # Shooting condition constraints
-    # --------------------------------------------------------
-
-    # High ISO:
-    # discourage aggressive contrast.
-    if condition.iso_factor > 0.6:
-
-        score -= (
-            max(
-                contrast - 0.25,
-                0,
-            )
-            *
-            condition.iso_factor
-            *
-            0.5
-        )
-
-    # Low-light images:
-    # protect shadows.
-    if condition.low_light > 0.6:
-
-        dark_ratio = float(
-            np.mean(
-                lum < 0.08
-            )
-        )
-
-        score -= (
-            dark_ratio
-            *
-            condition.low_light
-            *
-            0.15
-        )
-
-    # Don't change exposure too much.
-    score -= (
-        abs(
-            mean
-            -
-            analysis.mean
-        )
-        *
-        0.15
-    )
-
-    return float(
-        score
-    )
-
-
-def automatic_parameter_search(
-    img,
-    analysis,
-    profile,
-    condition,
-):
-
-    best_score = -float(
-        "inf"
-    )
-
-    best = (
-        0.0,
-        1.0,
-        1.0,
-    )
-
-    ev_values = [
-        -0.30,
-        -0.15,
-        0.00,
-        0.15,
-        0.30,
-    ]
-
-    contrast_values = [
-        0.96,
-        1.00,
-        1.03,
-        1.06,
-    ]
-
-    saturation_values = [
-        0.96,
-        1.00,
-        1.03,
-        1.05,
-    ]
-
-    for ev in ev_values:
-
-        for contrast in contrast_values:
-
-            for saturation in saturation_values:
-
-                test = apply_exposure(
-                    img,
-                    ev
-                    +
-                    profile.exposure,
-                )
-
-                test = apply_contrast(
-                    test,
-                    contrast
-                    *
-                    profile.contrast,
-                )
-
-                test = apply_saturation(
-                    test,
-                    saturation
-                    *
-                    profile.saturation,
-                )
-
-                score = evaluate_candidate(
-                    test,
-                    analysis,
-                    condition,
-                )
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best = (
-                        ev
-                        +
-                        profile.exposure,
-
-                        contrast
-                        *
-                        profile.contrast,
-
-                        saturation
-                        *
-                        profile.saturation,
-                    )
-
-    print(
-        "[INFO] Auto parameters: "
-        f"EV={best[0]:+.2f}, "
-        f"contrast={best[1]:.3f}, "
-        f"saturation={best[2]:.3f}"
-    )
-
-    print(
-        f"[INFO] Parameter score: "
-        f"{best_score:.4f}"
-    )
-
-    return best
-
-
-# ============================================================
-# ISO / shooting condition adjustment
-# ============================================================
-
-def calculate_final_processing(
-    profile,
+    subjects,
     scene_profile,
-    condition,
 ):
+    if not subjects:
+        return img
 
-    denoise = max(
-        scene_profile.denoise,
-        condition.estimated_noise,
+    out = img.copy()
+
+    for subject in subjects[:3]:
+
+        if subject.mask is None:
+            continue
+
+        mask = subject.mask.astype(
+            np.float32
+        )
+
+        mask = cv2.GaussianBlur(
+            mask,
+            (0, 0),
+            8,
+        )
+
+        strength = (
+            scene_profile.subject_strength
+            * clamp01(
+                subject.score * 1.3
+            )
+        )
+
+        if strength <= 0:
+            continue
+
+        gray = cv2.cvtColor(
+            out.astype(np.float32),
+            cv2.COLOR_RGB2GRAY,
+        )
+
+        blur = cv2.GaussianBlur(
+            gray,
+            (0, 0),
+            7,
+        )
+
+        detail = (
+            gray
+            - blur
+        )
+
+        out += (
+            detail[:, :, None]
+            * strength
+            * mask[:, :, None]
+        )
+
+    return np.clip(out, 0, 1)
+
+
+# ============================================================
+# Background suppression
+# ============================================================
+
+def suppress_background(
+    img,
+    masks,
+    scene_profile,
+):
+    background = masks.get(
+        "background"
     )
 
-    sharpen = (
-        scene_profile.sharpen
+    if background is None:
+        return img
+
+    strength = (
+        scene_profile.background_suppression
     )
 
-    # High ISO
-    sharpen *= (
+    if strength <= 0:
+        return img
+
+    out = img.copy()
+
+    # Slightly reduce saturation
+    hsv = cv2.cvtColor(
+        out.astype(np.float32),
+        cv2.COLOR_RGB2HSV,
+    )
+
+    hsv[:, :, 1] *= (
         1.0
-        -
-        0.35
-        *
-        condition.iso_factor
+        - strength * background
     )
 
-    # Low light
-    sharpen *= (
-        1.0
-        -
-        0.15
-        *
-        condition.low_light
+    hsv[:, :, 1] = np.clip(
+        hsv[:, :, 1],
+        0,
+        1,
     )
 
-    # Long exposure
-    sharpen *= (
-        1.0
-        -
-        0.10
-        *
-        condition.motion_risk
+    out = cv2.cvtColor(
+        hsv,
+        cv2.COLOR_HSV2RGB,
     )
 
-    denoise = clamp01(
-        denoise
+    # Slightly reduce local contrast
+    gray = cv2.cvtColor(
+        out.astype(np.float32),
+        cv2.COLOR_RGB2GRAY,
     )
 
-    sharpen = clamp01(
-        sharpen
+    blur = cv2.GaussianBlur(
+        gray,
+        (0, 0),
+        9,
     )
 
-    return (
-        denoise,
-        sharpen,
+    detail = gray - blur
+
+    out -= (
+        detail[:, :, None]
+        * strength
+        * background[:, :, None]
+    )
+
+    return np.clip(out, 0, 1)
+
+
+# ============================================================
+# JPEG
+# ============================================================
+
+def save_jpeg(img, path, quality=95):
+    arr = np.clip(
+        img * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    # Internal processing is RGB.
+    # OpenCV writes BGR.
+    arr = cv2.cvtColor(
+        arr,
+        cv2.COLOR_RGB2BGR,
+    )
+
+    cv2.imwrite(
+        str(path),
+        arr,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            quality,
+        ],
     )
 
 
 # ============================================================
-# Main development
+# Logging
 # ============================================================
 
-def develop_image(
-    rgb,
-    profile,
-    segmenter,
+def print_camera_profile(profile):
+    print(
+        f"[INFO] RAW camera: "
+        f"{profile.make or 'UNKNOWN'} "
+        f"{profile.model or 'UNKNOWN'}"
+    )
+
+    print(
+        f"[INFO] Camera family: "
+        f"{profile.family}"
+    )
+
+    if profile.iso is not None:
+        print(
+            f"[INFO] ISO: "
+            f"{profile.iso:g}"
+        )
+
+    if profile.exposure_time is not None:
+        print(
+            f"[INFO] Exposure: "
+            f"{profile.exposure_time:g} sec"
+        )
+
+    if profile.f_number is not None:
+        print(
+            f"[INFO] Aperture: "
+            f"f/{profile.f_number:g}"
+        )
+
+    if profile.focal_length is not None:
+        print(
+            f"[INFO] Focal length: "
+            f"{profile.focal_length:g} mm"
+        )
+
+    if profile.lens_model:
+        print(
+            f"[INFO] Lens: "
+            f"{profile.lens_model}"
+        )
+
+    if profile.color_temperature is not None:
+        print(
+            f"[INFO] Color temperature: "
+            f"{profile.color_temperature:g} K"
+        )
+
+    print(
+        f"[INFO] Metadata source: "
+        f"{profile.metadata_source}"
+    )
+
+    print(
+        f"[INFO] LibRaw: "
+        f"{profile.libraw_version}"
+    )
+
+    print(
+        f"[INFO] RAW size: "
+        f"{profile.raw_width} x "
+        f"{profile.raw_height}"
+    )
+
+    if profile.color_desc:
+        print(
+            f"[INFO] Color description: "
+            f"{profile.color_desc}"
+        )
+
+    print(
+        f"[INFO] Number of colors: "
+        f"{profile.num_colors}"
+    )
+
+    if profile.white_level is not None:
+        print(
+            f"[INFO] RAW white level: "
+            f"{profile.white_level:g}"
+        )
+
+    if profile.camera_wb is not None:
+        print(
+            "[INFO] Camera WB: "
+            + np.array2string(
+                profile.camera_wb,
+                precision=3,
+            )
+        )
+
+    if profile.rgb_xyz_matrix is not None:
+        print(
+            "[INFO] RGB->XYZ matrix available"
+        )
+
+    if profile.color_matrix is not None:
+        print(
+            "[INFO] Color matrix available"
+        )
+
+
+def print_stats(stats):
+    print(
+        "[INFO] "
+        f"mean={stats.mean:.3f}, "
+        f"median={stats.median:.3f}, "
+        f"p01={stats.p01:.3f}, "
+        f"p05={stats.p05:.3f}, "
+        f"p95={stats.p95:.3f}, "
+        f"p99={stats.p99:.3f}"
+    )
+
+    print(
+        "[INFO] "
+        f"shadow={stats.shadow_ratio:.3f}, "
+        f"highlight={stats.highlight_ratio:.3f}, "
+        f"saturation={stats.saturation_ratio:.3f}, "
+        f"contrast={stats.contrast:.3f}, "
+        f"edge={stats.edge_density:.3f}"
+    )
+
+
+def print_subjects(subjects):
+    if not subjects:
+        print("[INFO] Subjects: none")
+        return
+
+    print("[INFO] Subject candidates:")
+
+    for s in subjects[:5]:
+        print(
+            f"       {s.class_name:12s} "
+            f"score={s.score:.3f} "
+            f"conf={s.confidence:.3f} "
+            f"area={s.area:.3f} "
+            f"saliency={s.saliency:.3f}"
+        )
+
+
+# ============================================================
+# Main processing
+# ============================================================
+
+def process_raw(
+    path: Path,
+    output_path: Path,
+    segmenter: Segmenter,
 ):
+    print()
+    print("=" * 72)
+    print(f"[INFO] Processing: {path}")
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    metadata = extract_metadata(path)
+
+    # --------------------------------------------------------
+    # RAW
+    # --------------------------------------------------------
+
+    raw, camera_rgb = develop_raw_camera_rgb(
+        path
+    )
+
+    try:
+        profile = make_camera_profile(
+            raw,
+            metadata,
+        )
+
+        print_camera_profile(profile)
+
+        # ----------------------------------------------------
+        # Camera RGB -> sRGB
+        # ----------------------------------------------------
+
+        img = camera_rgb_to_srgb(
+            camera_rgb,
+            profile,
+        )
+
+    finally:
+        raw.close()
+
+    # --------------------------------------------------------
+    # Resize for expensive analysis
+    # --------------------------------------------------------
+
+    analysis_img = resize_for_analysis(
+        img,
+        max_size=1024,
+    )
+
+    # --------------------------------------------------------
+    # Image analysis
+    # --------------------------------------------------------
+
+    stats = analyze_image(
+        analysis_img
+    )
+
+    print_stats(stats)
+
+    shooting = analyze_shooting_condition(
+        profile
+    )
 
     print(
-        "[INFO] Analyzing image..."
+        "[INFO] Shooting condition: "
+        f"ISO-factor={shooting.iso_factor:.2f}, "
+        f"low-light={shooting.low_light:.2f}, "
+        f"motion-risk={shooting.motion_risk:.2f}, "
+        f"DOF={shooting.shallow_dof:.2f}, "
+        f"noise={shooting.estimated_noise:.2f}"
     )
 
-    analysis = analyze_image(
-        rgb
+    # --------------------------------------------------------
+    # Saliency
+    # --------------------------------------------------------
+
+    saliency = compute_saliency(
+        analysis_img
     )
 
-    print(
-        "[INFO] "
-        f"mean={analysis.mean:.3f} "
-        f"median={analysis.median:.3f} "
-        f"p01={analysis.p01:.3f} "
-        f"p99={analysis.p99:.3f}"
-    )
+    # --------------------------------------------------------
+    # Semantic segmentation
+    # --------------------------------------------------------
 
-    print(
-        "[INFO] "
-        f"shadow={analysis.shadow_ratio:.3f} "
-        f"highlight={analysis.highlight_ratio:.3f} "
-        f"edge={analysis.edge_density:.3f} "
-        f"contrast={analysis.contrast:.3f}"
-    )
-
-    condition = analyze_shooting_condition(
-        profile,
-        analysis,
-    )
-
-    print_shooting_condition(
-        condition
-    )
-
-    print(
-        "[INFO] Semantic segmentation..."
-    )
-
-    labels, confidence = (
+    segmentation, confidence = (
         segmenter.predict(
-            rgb
+            analysis_img
         )
     )
 
-    print(
-        "[INFO] Saliency..."
-    )
+    # --------------------------------------------------------
+    # Subject ranking
+    # --------------------------------------------------------
 
-    saliency = calculate_saliency_map(
-        rgb
-    )
-
-    subjects = calculate_subjects(
-        labels,
+    subjects = rank_subjects(
+        analysis_img,
+        segmentation,
         confidence,
         saliency,
-        rgb,
     )
 
-    if subjects:
+    print_subjects(subjects)
 
-        print(
-            "[INFO] Subjects:"
+    # --------------------------------------------------------
+    # Scene
+    # --------------------------------------------------------
+
+    scene = classify_scene(
+        stats,
+        profile,
+        segmentation,
+    )
+
+    print(
+        f"[INFO] Scene: {scene}"
+    )
+
+    scene_profile = SCENE_PROFILES[
+        scene
+    ]
+
+    # --------------------------------------------------------
+    # Global optimization
+    # --------------------------------------------------------
+
+    print(
+        "[INFO] Running global parameter search..."
+    )
+
+    global_ev, global_contrast, global_sat, out = (
+        optimize_global(
+            analysis_img,
+            scene_profile,
         )
+    )
 
-        for s in subjects[:5]:
+    print(
+        "[INFO] Global parameters: "
+        f"EV={global_ev:+.2f}, "
+        f"contrast={global_contrast:.3f}, "
+        f"saturation={global_sat:.3f}"
+    )
 
-            print(
-                "  "
-                f"{s.class_name}: "
-                f"conf={s.confidence:.2f}, "
-                f"area={s.area:.3f}, "
-                f"saliency={s.saliency_score:.2f}, "
-                f"score={s.score:.3f}"
-            )
+    # --------------------------------------------------------
+    # Region masks
+    # --------------------------------------------------------
 
-    else:
-
-        print(
-            "[INFO] Subject: none"
-        )
-
-    scene_name = classify_scene(
-        analysis,
+    masks = build_region_masks(
+        analysis_img,
+        segmentation,
         subjects,
-        condition,
     )
 
-    scene_profile = (
-        SCENE_PROFILES[
-            scene_name
-        ]
+    region_profiles = make_region_profiles(
+        scene,
+        stats,
+        shooting,
     )
 
-    print(
-        f"[INFO] Scene: "
-        f"{scene_name}"
-    )
+    # --------------------------------------------------------
+    # RAW headroom
+    # --------------------------------------------------------
 
-    denoise_strength, sharpen_strength = (
-        calculate_final_processing(
-            profile,
-            scene_profile,
-            condition,
+    if profile.white_level:
+        white_level = profile.white_level
+
+        # Camera RGB is normalized to white level.
+        # Use image highlight occupancy as practical
+        # headroom estimate.
+        headroom = clamp01(
+            1.0 - stats.highlight_ratio * 8.0
         )
-    )
+    else:
+        headroom = 0.5
 
-    print(
-        f"[INFO] Final denoise: "
-        f"{denoise_strength:.2f}"
-    )
+    # --------------------------------------------------------
+    # Region-aware development
+    # --------------------------------------------------------
 
-    print(
-        f"[INFO] Final sharpen: "
-        f"{sharpen_strength:.2f}"
-    )
+    region_order = [
+        "sky",
+        "water",
+        "vegetation",
+        "building",
+        "vehicle",
+        "person",
+        "background",
+    ]
 
-    cam_ev, cam_contrast, cam_saturation = (
-        camera_adjustment(
-            profile
+    for region_name in region_order:
+
+        mask = masks.get(
+            region_name
         )
-    )
 
-    working = rgb.copy()
-
-    # --------------------------------------------------------
-    # Camera profile
-    # --------------------------------------------------------
-
-    working = apply_exposure(
-        working,
-        cam_ev,
-    )
-
-    working = apply_contrast(
-        working,
-        cam_contrast,
-    )
-
-    working = apply_saturation(
-        working,
-        cam_saturation,
-    )
-
-    # --------------------------------------------------------
-    # CCT
-    # --------------------------------------------------------
-
-    working = color_temperature_adjustment(
-        working,
-        profile,
-    )
-
-    # --------------------------------------------------------
-    # Automatic search
-    # --------------------------------------------------------
-
-    ev, contrast, saturation = (
-        automatic_parameter_search(
-            working,
-            analysis,
-            scene_profile,
-            condition,
+        region_profile = region_profiles.get(
+            region_name
         )
-    )
 
-    working = apply_exposure(
-        working,
-        ev,
-    )
+        if mask is None or region_profile is None:
+            continue
 
-    working = apply_contrast(
-        working,
-        contrast,
-    )
+        coverage = float(
+            np.mean(mask > 0.05)
+        )
 
-    working = apply_saturation(
-        working,
-        saturation,
-    )
+        if coverage < 0.002:
+            continue
 
-    # --------------------------------------------------------
-    # Tone protection
-    # --------------------------------------------------------
+        print(
+            f"[INFO] Region {region_name}: "
+            f"coverage={coverage:.3f}, "
+            f"EV={region_profile.exposure:+.2f}, "
+            f"contrast={region_profile.contrast:.3f}, "
+            f"saturation={region_profile.saturation:.3f}"
+        )
 
-    working = apply_tone_protection(
-        working,
-        profile,
-        scene_profile.highlight,
-        scene_profile.shadow,
-    )
+        out = apply_region_adjustment(
+            out,
+            mask,
+            region_profile,
+            headroom,
+        )
 
     # --------------------------------------------------------
-    # Local subject
+    # Subject emphasis
     # --------------------------------------------------------
 
-    working = apply_local_subject(
-        working,
-        labels,
+    out = apply_subject_emphasis(
+        out,
         subjects,
         scene_profile,
-        condition,
     )
 
     # --------------------------------------------------------
-    # CLAHE
+    # Background suppression
     # --------------------------------------------------------
 
-    clahe_strength = 0.35
+    out = suppress_background(
+        out,
+        masks,
+        scene_profile,
+    )
 
-    if scene_name == "night":
+    # --------------------------------------------------------
+    # Tone mapping
+    # --------------------------------------------------------
 
-        clahe_strength = 0.20
-
-    elif scene_name == "portrait":
-
-        clahe_strength = 0.15
-
-    elif condition.iso_factor > 0.7:
-
-        clahe_strength = 0.15
-
-    working = apply_clahe(
-        working,
-        clahe_strength,
+    out = luminance_tone_map(
+        out,
+        scene_profile.highlight_protection,
+        scene_profile.shadow_lift,
     )
 
     # --------------------------------------------------------
     # Denoise
     # --------------------------------------------------------
 
-    working = apply_denoise(
-        working,
-        denoise_strength,
+    out = denoise_image(
+        out,
+        scene_profile.denoise
+        + shooting.estimated_noise * 0.20,
     )
 
     # --------------------------------------------------------
     # Sharpen
     # --------------------------------------------------------
 
-    working = apply_sharpen(
-        working,
+    sharpen_strength = (
+        scene_profile.sharpen
+        * (
+            1.0
+            - 0.35
+            * shooting.estimated_noise
+        )
+    )
+
+    out = sharpen_image(
+        out,
         sharpen_strength,
     )
 
-    return clamp01(
-        working
-    )
-
-
-# ============================================================
-# Save JPEG
-# ============================================================
-
-def save_jpeg(
-    img,
-    output_path,
-    quality=95,
-):
-
-    img8 = (
-        clamp01(img)
-        * 255
-    ).astype(
-        np.uint8
-    )
-
-    pil = Image.fromarray(
-        img8,
-        mode="RGB",
-    )
-
-    pil.save(
-        output_path,
-        "JPEG",
-        quality=quality,
-        subsampling=0,
-        optimize=True,
-    )
-
-
-# ============================================================
-# Process RAW
-# ============================================================
-
-def process_raw(
-    path,
-    output_path,
-    device,
-):
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"[INFO] Processing: "
-        f"{path}"
-    )
-
-    print(
-        "=" * 70
-    )
-
     # --------------------------------------------------------
-    # Metadata
+    # Final output
     # --------------------------------------------------------
-
-    exiftool_meta = read_exiftool(
-        path
-    )
-
-    pillow_meta = read_pillow_exif(
-        path
-    )
-
-    metadata = merge_metadata(
-        exiftool_meta,
-        pillow_meta,
-    )
-
-    if (
-        metadata.make
-        or
-        metadata.model
-    ):
-
-        print(
-            "[INFO] EXIF camera: "
-            f"{metadata.make} "
-            f"{metadata.model}"
-        )
-
-    else:
-
-        print(
-            "[WARN] EXIF camera "
-            "information unavailable."
-        )
-
-    # --------------------------------------------------------
-    # RAW
-    # --------------------------------------------------------
-
-    try:
-
-        raw, camera_rgb = (
-            load_linear_camera_rgb(
-                path
-            )
-        )
-
-        profile = build_camera_profile(
-            raw,
-            metadata,
-        )
-
-        print_camera_profile(
-            profile
-        )
-
-        # ----------------------------------------------------
-        # Camera color conversion
-        # ----------------------------------------------------
-
-        print(
-            "[INFO] Camera RGB -> sRGB..."
-        )
-
-        rgb = camera_rgb_to_srgb(
-            camera_rgb,
-            profile,
-        )
-
-        raw.close()
-
-    except Exception as e:
-
-        print(
-            "[ERROR] RAW processing failed: "
-            f"{e}"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # Semantic model
-    # --------------------------------------------------------
-
-    try:
-
-        segmenter = SemanticSegmenter(
-            device=device,
-            max_size=768,
-        )
-
-    except Exception as e:
-
-        print(
-            "[ERROR] Semantic model "
-            f"initialization failed: {e}"
-        )
-
-        segmenter = None
-
-    # --------------------------------------------------------
-    # Develop
-    # --------------------------------------------------------
-
-    if segmenter is not None:
-
-        result = develop_image(
-            rgb,
-            profile,
-            segmenter,
-        )
-
-    else:
-
-        print(
-            "[WARN] Running basic "
-            "automatic development."
-        )
-
-        analysis = analyze_image(
-            rgb
-        )
-
-        condition = (
-            analyze_shooting_condition(
-                profile,
-                analysis,
-            )
-        )
-
-        scene_profile = (
-            SCENE_PROFILES[
-                "general"
-            ]
-        )
-
-        ev, contrast, saturation = (
-            automatic_parameter_search(
-                rgb,
-                analysis,
-                scene_profile,
-                condition,
-            )
-        )
-
-        result = apply_exposure(
-            rgb,
-            ev,
-        )
-
-        result = apply_contrast(
-            result,
-            contrast,
-        )
-
-        result = apply_saturation(
-            result,
-            saturation,
-        )
-
-        result = apply_tone_protection(
-            result,
-            profile,
-            scene_profile.highlight,
-            scene_profile.shadow,
-        )
-
-        denoise, sharpen = (
-            calculate_final_processing(
-                profile,
-                scene_profile,
-                condition,
-            )
-        )
-
-        result = apply_denoise(
-            result,
-            denoise,
-        )
-
-        result = apply_sharpen(
-            result,
-            sharpen,
-        )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
     save_jpeg(
-        result,
+        out,
         output_path,
         quality=95,
     )
 
     print(
-        f"[INFO] Saved: "
-        f"{output_path}"
+        f"[INFO] Output: {output_path}"
     )
 
-    return True
-
 
 # ============================================================
-# RAW collection
+# Collect RAW files
 # ============================================================
 
-def collect_raw_files(
-    input_path,
-):
-
-    if input_path.is_file():
-
-        if (
-            input_path.suffix.lower()
-            in RAW_EXTENSIONS
-        ):
-
-            return [
-                input_path
-            ]
-
-        return []
-
+def collect_raw_files(directory):
     files = []
 
-    for path in input_path.rglob("*"):
-
+    for path in directory.rglob("*"):
         if (
             path.is_file()
-            and
-            path.suffix.lower()
+            and path.suffix.lower()
             in RAW_EXTENSIONS
         ):
+            files.append(path)
 
-            files.append(
-                path
-            )
-
-    return sorted(
-        files
-    )
+    return sorted(files)
 
 
 # ============================================================
@@ -3899,10 +2598,9 @@ def collect_raw_files(
 # ============================================================
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
-            "Automatic RAW Developer v14"
+            "Automatic RAW development v15"
         )
     )
 
@@ -3916,9 +2614,7 @@ def main():
         "-o",
         "--output",
         type=Path,
-        default=Path(
-            "./output"
-        ),
+        default=Path("./output"),
         help="Output directory",
     )
 
@@ -3929,130 +2625,120 @@ def main():
             "cpu",
             "cuda",
         ],
-        help=(
-            "Semantic segmentation device"
-        ),
+        help="Segmentation device",
     )
 
     args = parser.parse_args()
 
     if not args.input.exists():
-
         print(
-            "[ERROR] Input does not exist: "
+            f"[ERROR] Not found: "
             f"{args.input}"
         )
-
         sys.exit(1)
 
-    if (
-        args.device == "cuda"
-    ):
-
-        try:
-
-            import torch
-
-            if not torch.cuda.is_available():
-
-                print(
-                    "[WARN] CUDA unavailable. "
-                    "Using CPU."
-                )
-
-                args.device = "cpu"
-
-        except Exception:
-
-            print(
-                "[WARN] PyTorch unavailable "
-                "for CUDA check."
-            )
-
-            args.device = "cpu"
-
-    files = collect_raw_files(
-        args.input
+    args.output.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    if not files:
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
 
+    device = args.device
+
+    if device == "cuda":
+
+        if torch is None:
+            print(
+                "[ERROR] PyTorch is not installed."
+            )
+            sys.exit(1)
+
+        if not torch.cuda.is_available():
+            print(
+                "[WARN] CUDA requested but "
+                "CUDA is unavailable. "
+                "Using CPU."
+            )
+
+            device = "cpu"
+
+    print(
+        f"[INFO] Device: {device}"
+    )
+
+    # --------------------------------------------------------
+    # Load model ONCE
+    # --------------------------------------------------------
+
+    segmenter = Segmenter(
+        device=device
+    )
+
+    # --------------------------------------------------------
+    # Input files
+    # --------------------------------------------------------
+
+    if args.input.is_file():
+
+        raw_files = [
+            args.input
+        ]
+
+    else:
+
+        raw_files = collect_raw_files(
+            args.input
+        )
+
+    if not raw_files:
         print(
             "[ERROR] No RAW files found."
         )
-
         sys.exit(1)
 
     print(
         f"[INFO] RAW files: "
-        f"{len(files)}"
+        f"{len(raw_files)}"
     )
 
-    success = 0
+    # --------------------------------------------------------
+    # Process
+    # --------------------------------------------------------
 
-    for raw_path in files:
-
-        if args.input.is_file():
-
-            relative = (
-                raw_path.stem
-                +
-                ".jpg"
-            )
-
-        else:
-
-            try:
-
-                relative = (
-                    raw_path
-                    .relative_to(
-                        args.input
-                    )
-                    .with_suffix(
-                        ".jpg"
-                    )
-                )
-
-            except ValueError:
-
-                relative = (
-                    raw_path.stem
-                    +
-                    ".jpg"
-                )
+    for raw_path in raw_files:
 
         output_path = (
             args.output
-            /
-            relative
+            / f"{raw_path.stem}.jpg"
         )
 
-        if process_raw(
-            raw_path,
-            output_path,
-            args.device,
-        ):
+        try:
 
-            success += 1
+            process_raw(
+                raw_path,
+                output_path,
+                segmenter,
+            )
+
+        except Exception as e:
+
+            print(
+                f"[ERROR] Failed: "
+                f"{raw_path}"
+            )
+
+            print(
+                f"        {type(e).__name__}: "
+                f"{e}"
+            )
 
     print()
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"[INFO] Finished: "
-        f"{success}/{len(files)}"
-    )
-
-    print(
-        "=" * 70
-    )
+    print("=" * 72)
+    print("[INFO] All processing finished.")
 
 
 if __name__ == "__main__":
-
     main()
-
