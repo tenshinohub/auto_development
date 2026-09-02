@@ -1,18 +1,53 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+auto_develop_v19.py
+
+Automatic RAW Development v19 Debug Edition
+
+v18 -> v19 changes
+-------------------
+1. LibRaw sRGB color conversion is retained.
+2. gamma=(1,1) output is treated as LINEAR RGB.
+   Do NOT apply srgb_to_linear() to it.
+3. Analysis is performed on display-referred sRGB generated from
+   linear RGB.
+4. --debug only:
+   - detailed statistics
+   - intermediate images
+   - JSON report
+   - segmentation / saliency / masks
+   - development stage images
+
+Usage
+-----
+Normal:
+    python3 auto_develop_v19.py photos -o output
+
+Debug:
+    python3 auto_develop_v19.py photos -o output --debug
+
+CUDA:
+    python3 auto_develop_v19.py photos -o output --device cuda --debug
+"""
 
 import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import warnings
+
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple
 
 import cv2
 import numpy as np
 import rawpy
-from PIL import Image, ExifTags
+from PIL import Image
 
 import torch
 from torchvision.models.segmentation import (
@@ -21,11 +56,14 @@ from torchvision.models.segmentation import (
 )
 
 
-VERSION = "v18"
+VERSION = "v19"
+
 
 RAW_EXTENSIONS = {
-    ".cr2", ".cr3",
-    ".nef", ".nrw",
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".nrw",
     ".arw",
     ".raf",
     ".orf",
@@ -36,8 +74,57 @@ RAW_EXTENSIONS = {
 }
 
 
+VOC_CLASSES = [
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor",
+]
+
+
+ANIMAL_CLASSES = {
+    "bird",
+    "cat",
+    "cow",
+    "dog",
+    "horse",
+    "sheep",
+}
+
+VEHICLE_CLASSES = {
+    "aeroplane",
+    "bicycle",
+    "boat",
+    "bus",
+    "car",
+    "motorbike",
+    "train",
+}
+
+PLANT_CLASSES = {
+    "pottedplant",
+}
+
+
 # ============================================================
-# Data classes
+# Dataclasses
 # ============================================================
 
 @dataclass
@@ -46,13 +133,16 @@ class ExifMetadata:
     model: str = ""
     lens_make: str = ""
     lens_model: str = ""
-    iso: float = 0.0
-    exposure_time: float = 0.0
-    f_number: float = 0.0
-    focal_length: float = 0.0
+
+    iso: Optional[float] = None
+    exposure_time: Optional[float] = None
+    f_number: Optional[float] = None
+    focal_length: Optional[float] = None
+
     white_balance: str = ""
-    color_temperature: float = 0.0
+    color_temperature: Optional[float] = None
     color_space: str = ""
+
     source: str = ""
 
 
@@ -61,21 +151,19 @@ class CameraProfile:
     make: str = ""
     model: str = ""
     family: str = ""
-    iso: float = 0.0
 
-    black_level: list = None
-    white_level: list = None
+    iso: Optional[float] = None
+    black_level: Optional[float] = None
+    white_level: Optional[float] = None
 
-    camera_whitebalance: list = None
-    color_matrix: list = None
-    rgb_xyz_matrix: list = None
+    camera_wb: Optional[List[float]] = None
+    color_matrix: Optional[List[List[float]]] = None
+    rgb_xyz_matrix: Optional[List[List[float]]] = None
 
     raw_width: int = 0
     raw_height: int = 0
 
-    lens_make: str = ""
-    lens_model: str = ""
-
+    lens: str = ""
     metadata_source: str = ""
     libraw_version: str = ""
 
@@ -84,20 +172,35 @@ class CameraProfile:
 class ImageStats:
     mean: float = 0.0
     median: float = 0.0
+
     p01: float = 0.0
     p05: float = 0.0
+    p25: float = 0.0
+    p75: float = 0.0
     p95: float = 0.0
     p99: float = 0.0
 
+    min_value: float = 0.0
+    max_value: float = 0.0
+
     shadow_ratio: float = 0.0
     highlight_ratio: float = 0.0
+
     dynamic_range: float = 0.0
     saturation_ratio: float = 0.0
 
     edge_density: float = 0.0
     warm_ratio: float = 0.0
+
     contrast: float = 0.0
     mean_luminance: float = 0.0
+
+    r_mean: float = 0.0
+    g_mean: float = 0.0
+    b_mean: float = 0.0
+
+    rg_ratio: float = 0.0
+    gb_ratio: float = 0.0
 
 
 @dataclass
@@ -113,63 +216,67 @@ class ShootingCondition:
 
 @dataclass
 class SubjectCandidate:
-    class_name: str
-    confidence: float
-    area: float
-    center: tuple
-    saliency: float
-    local_contrast: float
-    colorfulness: float
-    score: float
+    class_name: str = ""
+    confidence: float = 0.0
+    area: float = 0.0
+
+    center_x: float = 0.0
+    center_y: float = 0.0
+
+    saliency: float = 0.0
+    local_contrast: float = 0.0
+    colorfulness: float = 0.0
+
+    score: float = 0.0
 
 
 @dataclass
 class SceneResult:
-    scene: str
-    confidence: float
+    scene: str = "general"
+    confidence: float = 0.0
 
 
 @dataclass
 class RegionStats:
-    name: str
-    area: float
-    mean_luminance: float
-    mean_saturation: float
+    name: str = ""
+    area: float = 0.0
+    mean_luminance: float = 0.0
+    mean_saturation: float = 0.0
 
 
 @dataclass
 class DevelopParams:
-    exposure_ev: float
-    contrast: float
-    saturation: float
+    exposure_ev: float = 0.0
+    contrast: float = 1.04
+    saturation: float = 1.0
 
-    highlight_protection: float
-    shadow_lift: float
+    highlight_protection: float = 0.35
+    shadow_lift: float = 0.06
 
-    subject_exposure: float
-    subject_contrast: float
-    background_suppression: float
+    subject_exposure: float = 0.04
+    subject_contrast: float = 1.02
+    background_suppression: float = 0.015
 
-    denoise: float
-    sharpen: float
+    denoise: float = 0.30
+    sharpen: float = 0.75
 
-    region_skin_saturation: float
-    region_green_saturation: float
-    region_water_highlight: float
-    region_upper_highlight: float
+    region_skin_saturation: float = 0.96
+    region_green_saturation: float = 1.01
+    region_water_highlight: float = 0.07
+    region_upper_highlight: float = 0.12
 
-    tone_strength: float
+    tone_strength: float = 0.52
 
 
 # ============================================================
 # Utility
 # ============================================================
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def clamp01(x):
+    return np.clip(x, 0.0, 1.0)
 
 
-def safe_float(value, default=0.0):
+def safe_float(value, default=None):
     try:
         if value is None:
             return default
@@ -177,23 +284,16 @@ def safe_float(value, default=0.0):
         if isinstance(value, str):
             value = value.strip()
 
-            if not value:
-                return default
-
-            if "/" in value:
-                a, b = value.split("/", 1)
-                return float(a) / float(b)
-
         return float(value)
-
     except Exception:
         return default
 
 
-def safe_str(value, default=""):
-    if value is None:
+def safe_int(value, default=None):
+    try:
+        return int(value)
+    except Exception:
         return default
-    return str(value)
 
 
 def percentile(arr, p):
@@ -202,386 +302,56 @@ def percentile(arr, p):
     return float(np.percentile(arr, p))
 
 
-# ============================================================
-# ExifTool
-# ============================================================
-
-def run_exiftool(path):
-    try:
-        cmd = [
-            "exiftool",
-            "-j",
-            "-n",
-
-            "-Make",
-            "-Model",
-            "-CameraModelName",
-            "-UniqueCameraModel",
-
-            "-LensMake",
-            "-LensModel",
-
-            "-ISO",
-            "-ExposureTime",
-            "-FNumber",
-            "-FocalLength",
-
-            "-WhiteBalance",
-            "-ColorTemperature",
-            "-ColorSpace",
-
-            str(path),
-        ]
-
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode != 0:
-            return {}
-
-        data = json.loads(result.stdout)
-
-        if not data:
-            return {}
-
-        return data[0]
-
-    except Exception:
-        return {}
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# Pillow EXIF
+# Color conversion
 # ============================================================
 
-def read_pillow_exif(path):
-    result = {}
-
-    try:
-        with Image.open(path) as img:
-            exif = img.getexif()
-
-            if not exif:
-                return result
-
-            tag_map = {}
-
-            for key, value in exif.items():
-                name = ExifTags.TAGS.get(key, key)
-                tag_map[name] = value
-
-            result["Make"] = tag_map.get("Make", "")
-            result["Model"] = tag_map.get("Model", "")
-
-            result["LensModel"] = tag_map.get(
-                "LensModel",
-                tag_map.get("LensSpecification", ""),
-            )
-
-            result["ISO"] = tag_map.get(
-                "ISOSpeedRatings",
-                tag_map.get("PhotographicSensitivity", 0),
-            )
-
-            result["ExposureTime"] = tag_map.get(
-                "ExposureTime",
-                0,
-            )
-
-            result["FNumber"] = tag_map.get(
-                "FNumber",
-                0,
-            )
-
-            result["FocalLength"] = tag_map.get(
-                "FocalLength",
-                0,
-            )
-
-            result["WhiteBalance"] = tag_map.get(
-                "WhiteBalance",
-                "",
-            )
-
-            result["ColorSpace"] = tag_map.get(
-                "ColorSpace",
-                "",
-            )
-
-    except Exception:
-        pass
-
-    return result
-
-
-# ============================================================
-# Metadata
-# ============================================================
-
-def get_metadata(path):
-    data = run_exiftool(path)
-    source = "exiftool"
-
-    if not data:
-        data = read_pillow_exif(path)
-        source = "pillow"
-
-    make = safe_str(data.get("Make", ""))
-    model = safe_str(
-        data.get(
-            "CameraModelName",
-            data.get(
-                "UniqueCameraModel",
-                data.get("Model", ""),
-            ),
-        )
-    )
-
-    return ExifMetadata(
-        make=make,
-        model=model,
-        lens_make=safe_str(data.get("LensMake", "")),
-        lens_model=safe_str(data.get("LensModel", "")),
-
-        iso=safe_float(data.get("ISO", 0)),
-        exposure_time=safe_float(data.get("ExposureTime", 0)),
-        f_number=safe_float(data.get("FNumber", 0)),
-        focal_length=safe_float(data.get("FocalLength", 0)),
-
-        white_balance=safe_str(data.get("WhiteBalance", "")),
-        color_temperature=safe_float(
-            data.get("ColorTemperature", 0)
-        ),
-        color_space=safe_str(
-            data.get("ColorSpace", "")
-        ),
-
-        source=source,
-    )
-
-
-# ============================================================
-# Camera family
-# ============================================================
-
-def detect_camera_family(make, model):
-    text = f"{make} {model}".lower()
-
-    families = [
-        ("canon", ["canon"]),
-        ("nikon", ["nikon"]),
-        ("sony", ["sony"]),
-        ("fujifilm", ["fujifilm", "fuji"]),
-        ("panasonic", ["panasonic", "lumix"]),
-        ("olympus", ["olympus", "om system"]),
-        ("leica", ["leica"]),
-        ("pentax", ["pentax"]),
-        ("ricoh", ["ricoh"]),
-        ("sigma", ["sigma"]),
-        ("hasselblad", ["hasselblad"]),
-    ]
-
-    for family, keywords in families:
-        if any(k in text for k in keywords):
-            return family
-
-    return "unknown"
-
-
-# ============================================================
-# Camera profile
-# ============================================================
-
-def make_camera_profile(raw, metadata):
-    try:
-        black_level = np.asarray(
-            raw.black_level_per_channel
-        ).astype(float).tolist()
-    except Exception:
-        black_level = []
-
-    try:
-        white_level = np.asarray(
-            raw.camera_white_level_per_channel
-        ).astype(float).tolist()
-    except Exception:
-        white_level = []
-
-    try:
-        camera_wb = np.asarray(
-            raw.camera_whitebalance
-        ).astype(float).tolist()
-    except Exception:
-        camera_wb = []
-
-    try:
-        color_matrix = np.asarray(
-            raw.color_matrix
-        ).astype(float).tolist()
-    except Exception:
-        color_matrix = []
-
-    try:
-        rgb_xyz_matrix = np.asarray(
-            raw.rgb_xyz_matrix
-        ).astype(float).tolist()
-    except Exception:
-        rgb_xyz_matrix = []
-
-    try:
-        raw_width, raw_height = raw.raw_image.shape[1], raw.raw_image.shape[0]
-    except Exception:
-        raw_width = 0
-        raw_height = 0
-
-    try:
-        libraw_version = safe_str(
-            rawpy.libraw_version
-        )
-    except Exception:
-        libraw_version = ""
-
-    return CameraProfile(
-        make=metadata.make,
-        model=metadata.model,
-        family=detect_camera_family(
-            metadata.make,
-            metadata.model,
-        ),
-
-        iso=metadata.iso,
-
-        black_level=black_level,
-        white_level=white_level,
-
-        camera_whitebalance=camera_wb,
-        color_matrix=color_matrix,
-        rgb_xyz_matrix=rgb_xyz_matrix,
-
-        raw_width=raw_width,
-        raw_height=raw_height,
-
-        lens_make=metadata.lens_make,
-        lens_model=metadata.lens_model,
-
-        metadata_source=metadata.source,
-        libraw_version=libraw_version,
-    )
-
-
-# ============================================================
-# RAW development
-# ============================================================
-
-def raw_to_srgb(raw):
-    """
-    v18:
-    独自の camera RGB -> XYZ -> sRGB 変換を廃止。
-
-    LibRawにsRGB変換を任せる。
-    これによりv17で発生していた強い緑被りを回避する。
-    """
-
-    rgb = raw.postprocess(
-        use_camera_wb=True,
-        use_auto_wb=False,
-
-        output_color=rawpy.ColorSpace.sRGB,
-
-        output_bps=16,
-
-        gamma=(1, 1),
-
-        no_auto_bright=True,
-
-        highlight_mode=rawpy.HighlightMode.Blend,
-
-        half_size=False,
-        four_color_rgb=False,
-
-        demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
-    )
-
-    return rgb
-
-
-def raw_to_srgb_fallback(raw):
-    """
-    念のため通常のLibRaw sRGB処理へフォールバック。
-    """
-
-    rgb = raw.postprocess(
-        use_camera_wb=True,
-        use_auto_wb=False,
-
-        output_color=rawpy.ColorSpace.sRGB,
-
-        output_bps=16,
-
-        no_auto_bright=False,
-
-        highlight_mode=rawpy.HighlightMode.Blend,
-
-        half_size=False,
-        four_color_rgb=False,
-
-        demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
-    )
-
-    return rgb
-
-
-# ============================================================
-# RGB conversion
-# ============================================================
-
-def srgb16_to_float(rgb):
-    """
-    16bit sRGB -> float [0,1]
-    """
-
-    return np.asarray(rgb, dtype=np.float32) / 65535.0
-
-
-def srgb_to_linear(rgb):
-    rgb = np.clip(rgb, 0.0, 1.0)
+def linear_to_srgb(x):
+    x = np.clip(x, 0.0, 1.0)
 
     return np.where(
-        rgb <= 0.04045,
-        rgb / 12.92,
-        ((rgb + 0.055) / 1.055) ** 2.4,
+        x <= 0.0031308,
+        12.92 * x,
+        1.055 * np.power(np.maximum(x, 0.0), 1.0 / 2.4) - 0.055,
     )
 
 
-def linear_to_srgb(rgb):
-    rgb = np.clip(rgb, 0.0, 1.0)
+def srgb_to_linear(x):
+    x = np.clip(x, 0.0, 1.0)
 
     return np.where(
-        rgb <= 0.0031308,
-        rgb * 12.92,
-        1.055 * np.power(rgb, 1.0 / 2.4) - 0.055,
+        x <= 0.04045,
+        x / 12.92,
+        np.power((x + 0.055) / 1.055, 2.4),
     )
 
 
 # ============================================================
-# Image analysis
+# Statistics
 # ============================================================
 
-def luminance(rgb):
-    return (
-        0.2126 * rgb[..., 0]
-        + 0.7152 * rgb[..., 1]
-        + 0.0722 * rgb[..., 2]
+def calculate_stats(rgb: np.ndarray) -> ImageStats:
+    rgb = np.asarray(rgb, dtype=np.float32)
+    rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("RGB image required")
+
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+
+    lum = (
+        0.2126 * r +
+        0.7152 * g +
+        0.0722 * b
     )
-
-
-def analyze_image(rgb):
-    lum = luminance(rgb)
 
     flat = lum.reshape(-1)
 
@@ -590,143 +360,543 @@ def analyze_image(rgb):
 
     p01 = percentile(flat, 1)
     p05 = percentile(flat, 5)
+    p25 = percentile(flat, 25)
+    p75 = percentile(flat, 75)
     p95 = percentile(flat, 95)
     p99 = percentile(flat, 99)
 
-    shadow_ratio = float(np.mean(flat < 0.02))
-    highlight_ratio = float(np.mean(flat > 0.98))
+    min_value = float(np.min(flat))
+    max_value = float(np.max(flat))
 
-    dynamic_range = math.log2(
-        max(p95, 1e-4) /
-        max(p05, 1e-4)
+    shadow_ratio = float(np.mean(lum <= 0.01))
+    highlight_ratio = float(np.mean(lum >= 0.99))
+
+    dynamic_range = math.log10(
+        max(p95, 1e-6) / max(p05, 1e-6)
     )
 
     hsv = cv2.cvtColor(
-        np.clip(rgb * 255, 0, 255).astype(np.uint8),
+        (rgb * 255.0).astype(np.uint8),
         cv2.COLOR_RGB2HSV,
     )
 
-    saturation = hsv[..., 1] / 255.0
+    saturation = hsv[:, :, 1].astype(np.float32) / 255.0
 
     saturation_ratio = float(
-        np.mean(saturation > 0.85)
+        np.mean(saturation > 0.90)
     )
 
-    gray = np.clip(
-        lum * 255,
-        0,
-        255,
-    ).astype(np.uint8)
+    warm = (
+        (r > b * 1.15) &
+        (r > g * 0.95) &
+        (g > b * 1.05)
+    )
 
-    sobel_x = cv2.Sobel(
-        gray,
+    warm_ratio = float(np.mean(warm))
+
+    gx = cv2.Sobel(
+        lum,
         cv2.CV_32F,
         1,
         0,
         ksize=3,
     )
 
-    sobel_y = cv2.Sobel(
-        gray,
+    gy = cv2.Sobel(
+        lum,
         cv2.CV_32F,
         0,
         1,
         ksize=3,
     )
 
-    edge = cv2.magnitude(
-        sobel_x,
-        sobel_y,
-    )
+    edge = cv2.magnitude(gx, gy)
 
     edge_density = float(
-        np.mean(edge > 35)
-    )
-
-    warm_ratio = float(
-        np.mean(
-            (rgb[..., 0] > rgb[..., 2] * 1.15)
-            &
-            (rgb[..., 0] > rgb[..., 1] * 1.03)
-        )
+        np.mean(edge > 0.08)
     )
 
     contrast = float(np.std(lum))
 
+    r_mean = float(np.mean(r))
+    g_mean = float(np.mean(g))
+    b_mean = float(np.mean(b))
+
+    rg_ratio = r_mean / max(g_mean, 1e-6)
+    gb_ratio = g_mean / max(b_mean, 1e-6)
+
     return ImageStats(
         mean=mean,
         median=median,
-
         p01=p01,
         p05=p05,
+        p25=p25,
+        p75=p75,
         p95=p95,
         p99=p99,
-
+        min_value=min_value,
+        max_value=max_value,
         shadow_ratio=shadow_ratio,
         highlight_ratio=highlight_ratio,
-
         dynamic_range=dynamic_range,
-
         saturation_ratio=saturation_ratio,
-
         edge_density=edge_density,
         warm_ratio=warm_ratio,
-
         contrast=contrast,
         mean_luminance=mean,
+        r_mean=r_mean,
+        g_mean=g_mean,
+        b_mean=b_mean,
+        rg_ratio=rg_ratio,
+        gb_ratio=gb_ratio,
     )
 
 
-# ============================================================
-# Shooting conditions
-# ============================================================
+def print_stats(name: str, rgb: np.ndarray):
+    stats = calculate_stats(rgb)
 
-def analyze_shooting(metadata):
-    iso = metadata.iso
-    exposure = metadata.exposure_time
-    f_number = metadata.f_number
-    focal = metadata.focal_length
-
-    if iso <= 0:
-        iso = 100
-
-    iso_factor = clamp(
-        math.sqrt(iso / 100.0),
-        1.0,
-        5.0,
+    print(f"\n[DEBUG] ===== {name} =====")
+    print(
+        f"  min/max      : "
+        f"{stats.min_value:.6f} / {stats.max_value:.6f}"
+    )
+    print(
+        f"  mean/median  : "
+        f"{stats.mean:.6f} / {stats.median:.6f}"
     )
 
-    if exposure > 0:
-        motion_risk = clamp(
-            math.log2(
-                max(exposure, 1e-6) / (1 / 125)
-            ) / 4 + 0.5,
+    print(
+        f"  p01/p05      : "
+        f"{stats.p01:.6f} / {stats.p05:.6f}"
+    )
+
+    print(
+        f"  p25/p75      : "
+        f"{stats.p25:.6f} / {stats.p75:.6f}"
+    )
+
+    print(
+        f"  p95/p99      : "
+        f"{stats.p95:.6f} / {stats.p99:.6f}"
+    )
+
+    print(
+        f"  shadow       : "
+        f"{stats.shadow_ratio * 100:.3f}%"
+    )
+
+    print(
+        f"  highlight    : "
+        f"{stats.highlight_ratio * 100:.3f}%"
+    )
+
+    print(
+        f"  dynamic range: "
+        f"{stats.dynamic_range:.3f}"
+    )
+
+    print(
+        f"  saturation   : "
+        f"{stats.saturation_ratio * 100:.3f}%"
+    )
+
+    print(
+        f"  edge density : "
+        f"{stats.edge_density:.4f}"
+    )
+
+    print(
+        f"  contrast     : "
+        f"{stats.contrast:.6f}"
+    )
+
+    print(
+        f"  RGB mean     : "
+        f"{stats.r_mean:.6f}, "
+        f"{stats.g_mean:.6f}, "
+        f"{stats.b_mean:.6f}"
+    )
+
+    print(
+        f"  R/G ratio    : {stats.rg_ratio:.4f}"
+    )
+
+    print(
+        f"  G/B ratio    : {stats.gb_ratio:.4f}"
+    )
+
+    return stats
+
+
+# ============================================================
+# Image saving
+# ============================================================
+
+def save_rgb(path: Path, rgb: np.ndarray):
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    img8 = np.round(
+        rgb * 255.0
+    ).astype(np.uint8)
+
+    Image.fromarray(
+        img8,
+        mode="RGB",
+    ).save(path)
+
+
+def save_gray(path: Path, image: np.ndarray):
+    image = np.clip(image, 0.0, 1.0)
+
+    img8 = np.round(
+        image * 255.0
+    ).astype(np.uint8)
+
+    Image.fromarray(
+        img8,
+        mode="L",
+    ).save(path)
+
+
+# ============================================================
+# EXIF
+# ============================================================
+
+class MetadataReader:
+
+    def __init__(self):
+        self.exiftool = shutil.which("exiftool")
+
+    def read(self, path: Path) -> ExifMetadata:
+        metadata = ExifMetadata()
+
+        if self.exiftool:
+            try:
+                metadata = self._read_exiftool(path)
+                metadata.source = "exiftool"
+                return metadata
+            except Exception as e:
+                warnings.warn(
+                    f"ExifTool failed for {path}: {e}"
+                )
+
+        try:
+            metadata = self._read_pillow(path)
+            metadata.source = "pillow"
+        except Exception:
+            pass
+
+        return metadata
+
+    def _read_exiftool(self, path: Path) -> ExifMetadata:
+        cmd = [
+            self.exiftool,
+            "-j",
+            "-n",
+            "-Make",
+            "-Model",
+            "-CameraModelName",
+            "-UniqueCameraModel",
+            "-LensMake",
+            "-LensModel",
+            "-ISO",
+            "-ExposureTime",
+            "-FNumber",
+            "-FocalLength",
+            "-WhiteBalance",
+            "-ColorTemperature",
+            "-ColorSpace",
+            str(path),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        data = json.loads(result.stdout)[0]
+
+        make = (
+            data.get("Make") or
+            ""
+        )
+
+        model = (
+            data.get("CameraModelName") or
+            data.get("UniqueCameraModel") or
+            data.get("Model") or
+            ""
+        )
+
+        return ExifMetadata(
+            make=str(make),
+            model=str(model),
+            lens_make=str(data.get("LensMake") or ""),
+            lens_model=str(data.get("LensModel") or ""),
+            iso=safe_float(data.get("ISO")),
+            exposure_time=safe_float(
+                data.get("ExposureTime")
+            ),
+            f_number=safe_float(
+                data.get("FNumber")
+            ),
+            focal_length=safe_float(
+                data.get("FocalLength")
+            ),
+            white_balance=str(
+                data.get("WhiteBalance") or ""
+            ),
+            color_temperature=safe_float(
+                data.get("ColorTemperature")
+            ),
+            color_space=str(
+                data.get("ColorSpace") or ""
+            ),
+            source="exiftool",
+        )
+
+    def _read_pillow(self, path: Path) -> ExifMetadata:
+        with Image.open(path) as img:
+            exif = img.getexif()
+
+        return ExifMetadata(
+            make=str(exif.get(271, "") or ""),
+            model=str(exif.get(272, "") or ""),
+            exposure_time=safe_float(
+                exif.get(33434)
+            ),
+            f_number=safe_float(
+                exif.get(33437)
+            ),
+            focal_length=safe_float(
+                exif.get(37386)
+            ),
+            iso=safe_float(
+                exif.get(34855)
+            ),
+            source="pillow",
+        )
+
+
+# ============================================================
+# Camera profile
+# ============================================================
+
+def detect_camera_family(make: str, model: str) -> str:
+    text = f"{make} {model}".lower()
+
+    families = {
+        "canon": ["canon"],
+        "nikon": ["nikon"],
+        "sony": ["sony"],
+        "fujifilm": ["fujifilm", "fuji"],
+        "panasonic": ["panasonic", "lumix"],
+        "olympus": ["olympus", "om digital"],
+        "leica": ["leica"],
+        "pentax": ["pentax"],
+        "ricoh": ["ricoh"],
+        "sigma": ["sigma"],
+        "hasselblad": ["hasselblad"],
+    }
+
+    for family, names in families.items():
+        if any(name in text for name in names):
+            return family
+
+    return "unknown"
+
+
+# ============================================================
+# RAW decoder
+# ============================================================
+
+class RawDecoder:
+
+    def __init__(self):
+        try:
+            self.libraw_version = rawpy.libraw_version
+        except Exception:
+            self.libraw_version = ""
+
+    def load(
+        self,
+        path: Path,
+    ) -> Tuple[np.ndarray, CameraProfile, Dict]:
+
+        with rawpy.imread(str(path)) as raw:
+
+            profile = CameraProfile()
+
+            profile.raw_width = int(
+                raw.sizes.width
+            )
+
+            profile.raw_height = int(
+                raw.sizes.height
+            )
+
+            profile.libraw_version = str(
+                self.libraw_version
+            )
+
+            try:
+                wb = raw.camera_whitebalance
+
+                if wb is not None:
+                    profile.camera_wb = [
+                        float(x)
+                        for x in np.asarray(wb).reshape(-1)
+                    ]
+
+            except Exception:
+                pass
+
+            try:
+                profile.black_level = float(
+                    np.mean(raw.black_level_per_channel)
+                )
+            except Exception:
+                pass
+
+            try:
+                profile.white_level = float(
+                    raw.white_level
+                )
+            except Exception:
+                pass
+
+            try:
+                profile.color_matrix = (
+                    np.asarray(
+                        raw.color_matrix,
+                        dtype=np.float32,
+                    ).tolist()
+                )
+            except Exception:
+                pass
+
+            try:
+                profile.rgb_xyz_matrix = (
+                    np.asarray(
+                        raw.rgb_xyz_matrix,
+                        dtype=np.float32,
+                    ).tolist()
+                )
+            except Exception:
+                pass
+
+            rgb16 = raw.postprocess(
+                use_camera_wb=True,
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.sRGB,
+                output_bps=16,
+
+                # IMPORTANT:
+                # gamma=(1,1) means identity transfer here.
+                # v19 treats this as linear RGB.
+                gamma=(1, 1),
+
+                no_auto_bright=True,
+
+                highlight_mode=rawpy.HighlightMode.Blend,
+
+                half_size=False,
+                four_color_rgb=False,
+
+                demosaic_algorithm=
+                rawpy.DemosaicAlgorithm.AHD,
+            )
+
+            raw_info = {
+                "shape": list(rgb16.shape),
+                "dtype": str(rgb16.dtype),
+                "raw_width": int(raw.sizes.width),
+                "raw_height": int(raw.sizes.height),
+            }
+
+        linear_rgb = (
+            np.asarray(
+                rgb16,
+                dtype=np.float32,
+            ) / 65535.0
+        )
+
+        linear_rgb = np.clip(
+            linear_rgb,
             0.0,
             1.0,
         )
-    else:
-        motion_risk = 0.0
 
-    shallow_dof = (
-        0 < f_number <= 2.8
+        return linear_rgb, profile, raw_info
+
+
+# ============================================================
+# Shooting condition
+# ============================================================
+
+def analyze_shooting(
+    metadata: ExifMetadata,
+) -> ShootingCondition:
+
+    iso = metadata.iso or 100.0
+
+    iso_factor = math.sqrt(
+        max(iso, 100.0) / 100.0
     )
 
-    wide_angle = (
-        0 < focal <= 28
-    )
-
-    telephoto = (
-        focal >= 85
+    iso_factor = float(
+        np.clip(
+            iso_factor,
+            1.0,
+            5.0,
+        )
     )
 
     low_light = (
         iso >= 1600
     )
 
-    estimated_noise = clamp(
-        (iso_factor - 1) / 4,
-        0,
-        1,
+    exposure = metadata.exposure_time
+
+    if exposure is None:
+        motion_risk = 0.0
+    else:
+        motion_risk = float(
+            np.clip(
+                (1.0 / max(exposure, 1e-6) - 1.0)
+                / 30.0,
+                0.0,
+                1.0,
+            )
+        )
+
+    f_number = metadata.f_number
+
+    shallow_dof = (
+        f_number is not None and
+        f_number <= 2.8
+    )
+
+    focal = metadata.focal_length
+
+    wide_angle = (
+        focal is not None and
+        focal <= 28
+    )
+
+    telephoto = (
+        focal is not None and
+        focal >= 85
+    )
+
+    estimated_noise = float(
+        np.clip(
+            (iso_factor - 1.0) / 4.0,
+            0.0,
+            1.0,
+        )
     )
 
     return ShootingCondition(
@@ -741,36 +911,16 @@ def analyze_shooting(metadata):
 
 
 # ============================================================
-# DeepLab segmentation
+# Semantic segmentation
 # ============================================================
 
 class SemanticSegmenter:
 
-    VOC_CLASSES = [
-        "background",
-        "aeroplane",
-        "bicycle",
-        "bird",
-        "boat",
-        "bottle",
-        "bus",
-        "car",
-        "cat",
-        "chair",
-        "cow",
-        "diningtable",
-        "dog",
-        "horse",
-        "motorbike",
-        "person",
-        "pottedplant",
-        "sheep",
-        "sofa",
-        "train",
-        "tvmonitor",
-    ]
-
-    def __init__(self, device="auto"):
+    def __init__(
+        self,
+        device: str = "auto",
+        max_dim: int = 768,
+    ):
 
         if device == "auto":
             device = (
@@ -780,15 +930,17 @@ class SemanticSegmenter:
             )
 
         if device == "cuda" and not torch.cuda.is_available():
-            warnings.warn(
-                "CUDA requested but unavailable. Falling back to CPU."
+            print(
+                "[WARN] CUDA requested but unavailable. "
+                "Falling back to CPU."
             )
             device = "cpu"
 
         self.device = torch.device(device)
+        self.max_dim = max_dim
 
         print(
-            f"[INFO] Segmentation device: "
+            f"[INFO] Loading DeepLabV3 on "
             f"{self.device}"
         )
 
@@ -803,111 +955,115 @@ class SemanticSegmenter:
                 )
             )
 
-            self.transform = weights.transforms()
+            self.transforms = (
+                weights.transforms()
+            )
 
         except Exception:
-
             self.model = (
                 deeplabv3_mobilenet_v3_large(
                     pretrained=True
                 )
             )
 
-            self.transform = None
+            self.transforms = None
 
-        self.model.to(self.device)
         self.model.eval()
+        self.model.to(self.device)
 
-    def predict(self, rgb):
+    def predict(
+        self,
+        rgb: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
         h, w = rgb.shape[:2]
 
         scale = min(
             1.0,
-            768.0 / max(h, w)
+            self.max_dim / max(h, w),
         )
 
-        if scale < 1:
-
-            small = cv2.resize(
-                rgb,
-                (
-                    int(w * scale),
-                    int(h * scale),
-                ),
-                interpolation=cv2.INTER_AREA,
-            )
-
-        else:
-            small = rgb
-
-        tensor = (
-            torch.from_numpy(
-                small.transpose(2, 0, 1)
-            )
-            .float()
+        nh = max(
+            1,
+            int(h * scale),
         )
 
-        if self.transform is not None:
+        nw = max(
+            1,
+            int(w * scale),
+        )
 
-            pil = Image.fromarray(
+        small = cv2.resize(
+            rgb,
+            (nw, nh),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        pil = Image.fromarray(
+            np.round(
                 np.clip(
-                    small * 255,
-                    0,
-                    255,
-                ).astype(np.uint8)
-            )
+                    small,
+                    0.0,
+                    1.0,
+                ) * 255.0
+            ).astype(np.uint8)
+        )
 
-            tensor = self.transform(pil)
+        if self.transforms is not None:
+            tensor = self.transforms(
+                pil
+            ).unsqueeze(0)
 
         else:
+            arr = np.asarray(
+                pil,
+                dtype=np.float32,
+            ) / 255.0
 
-            tensor = (
-                tensor / 255.0
-            )
+            tensor = torch.from_numpy(
+                arr
+            ).permute(
+                2, 0, 1
+            ).unsqueeze(0)
 
-        tensor = tensor.unsqueeze(0).to(
+        tensor = tensor.to(
             self.device
         )
 
         with torch.inference_mode():
-
             output = self.model(
                 tensor
             )["out"][0]
 
-            probs = torch.softmax(
-                output,
-                dim=0,
-            )
+        probabilities = torch.softmax(
+            output,
+            dim=0,
+        )
 
-            confidence, labels = torch.max(
-                probs,
-                dim=0,
-            )
+        confidence_small, labels_small = (
+            probabilities.max(dim=0)
+        )
 
-        labels = (
-            labels
-            .cpu()
+        labels_small = (
+            labels_small.cpu()
             .numpy()
             .astype(np.uint8)
         )
 
-        confidence = (
-            confidence
-            .cpu()
+        confidence_small = (
+            confidence_small.cpu()
             .numpy()
             .astype(np.float32)
         )
 
         labels = cv2.resize(
-            labels,
+            labels_small,
             (w, h),
             interpolation=cv2.INTER_NEAREST,
         )
 
         confidence = cv2.resize(
-            confidence,
+            confidence_small,
             (w, h),
             interpolation=cv2.INTER_LINEAR,
         )
@@ -919,29 +1075,36 @@ class SemanticSegmenter:
 # Saliency
 # ============================================================
 
-def compute_saliency(rgb):
+def compute_saliency(
+    rgb: np.ndarray,
+) -> np.ndarray:
 
-    lum = luminance(rgb)
-
-    gray = np.clip(
-        lum * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    blur = cv2.GaussianBlur(
-        gray,
-        (0, 0),
-        5,
+    lum = (
+        0.2126 * rgb[:, :, 0] +
+        0.7152 * rgb[:, :, 1] +
+        0.0722 * rgb[:, :, 2]
     )
 
-    local_contrast = cv2.absdiff(
-        gray,
-        blur,
-    ).astype(np.float32) / 255.0
+    local_mean = cv2.GaussianBlur(
+        lum,
+        (0, 0),
+        9,
+    )
+
+    local_contrast = np.abs(
+        lum - local_mean
+    )
+
+    local_contrast /= max(
+        float(np.percentile(
+            local_contrast,
+            99
+        )),
+        1e-6,
+    )
 
     gx = cv2.Sobel(
-        gray,
+        lum,
         cv2.CV_32F,
         1,
         0,
@@ -949,7 +1112,7 @@ def compute_saliency(rgb):
     )
 
     gy = cv2.Sobel(
-        gray,
+        lum,
         cv2.CV_32F,
         0,
         1,
@@ -961,49 +1124,39 @@ def compute_saliency(rgb):
         gy,
     )
 
-    edge /= (
-        np.percentile(edge, 99)
-        + 1e-6
-    )
-
-    edge = np.clip(
-        edge,
-        0,
-        1,
+    edge /= max(
+        float(np.percentile(
+            edge,
+            99
+        )),
+        1e-6,
     )
 
     hsv = cv2.cvtColor(
-        np.clip(
-            rgb * 255,
-            0,
-            255,
-        ).astype(np.uint8),
+        (rgb * 255).astype(np.uint8),
         cv2.COLOR_RGB2HSV,
     )
 
     saturation = (
-        hsv[..., 1].astype(np.float32)
+        hsv[:, :, 1].astype(np.float32)
         / 255.0
     )
 
-    mean_lum = np.mean(lum)
-
     brightness_dist = np.abs(
-        lum - mean_lum
-    )
-
-    brightness_dist /= (
-        np.percentile(
-            brightness_dist,
-            99,
+        lum -
+        cv2.GaussianBlur(
+            lum,
+            (0, 0),
+            15,
         )
-        + 1e-6
     )
 
-    brightness_dist = np.clip(
-        brightness_dist,
-        0,
-        1,
+    brightness_dist /= max(
+        float(np.percentile(
+            brightness_dist,
+            99
+        )),
+        1e-6,
     )
 
     h, w = lum.shape
@@ -1013,42 +1166,36 @@ def compute_saliency(rgb):
         0:w,
     ]
 
-    cx = (w - 1) / 2
-    cy = (h - 1) / 2
+    cx = w / 2.0
+    cy = h / 2.0
 
-    dist = np.sqrt(
-        ((xx - cx) / max(w, 1)) ** 2
-        +
-        ((yy - cy) / max(h, 1)) ** 2
+    dx = (
+        (xx - cx) /
+        max(cx, 1)
     )
 
-    center = np.clip(
-        1.0 - dist * 1.4,
-        0,
-        1,
+    dy = (
+        (yy - cy) /
+        max(cy, 1)
+    )
+
+    center = np.exp(
+        -(dx * dx + dy * dy)
+        / 0.8
     )
 
     saliency = (
-        local_contrast * 0.30
-        +
-        edge * 0.25
-        +
-        saturation * 0.15
-        +
-        brightness_dist * 0.20
-        +
-        center * 0.10
+        0.30 * local_contrast +
+        0.25 * edge +
+        0.15 * saturation +
+        0.20 * brightness_dist +
+        0.10 * center
     )
 
-    saliency -= saliency.min()
-
-    saliency /= (
-        saliency.max()
-        + 1e-6
-    )
-
-    return saliency.astype(
-        np.float32
+    return np.clip(
+        saliency,
+        0.0,
+        1.0,
     )
 
 
@@ -1057,46 +1204,31 @@ def compute_saliency(rgb):
 # ============================================================
 
 def rank_subjects(
-    rgb,
-    labels,
-    confidence,
-    saliency,
-):
+    labels: np.ndarray,
+    confidence: np.ndarray,
+    saliency: np.ndarray,
+    rgb: np.ndarray,
+) -> List[SubjectCandidate]:
 
     h, w = labels.shape
 
-    subjects = []
+    hsv = cv2.cvtColor(
+        (rgb * 255).astype(np.uint8),
+        cv2.COLOR_RGB2HSV,
+    )
 
-    excluded = {
-        "background",
-    }
+    saturation = (
+        hsv[:, :, 1].astype(np.float32)
+        / 255.0
+    )
 
-    priors = {
-        "person": 1.15,
-
-        "cat": 1.05,
-        "dog": 1.05,
-        "horse": 1.05,
-        "cow": 1.05,
-        "sheep": 1.05,
-        "bird": 1.05,
-
-        "car": 1.0,
-        "bus": 1.0,
-        "train": 1.0,
-        "boat": 1.0,
-        "bicycle": 1.0,
-        "motorbike": 1.0,
-
-        "pottedplant": 0.9,
-        "bottle": 0.85,
-    }
+    candidates = []
 
     for class_id, class_name in enumerate(
-        SemanticSegmenter.VOC_CLASSES
+        VOC_CLASSES
     ):
 
-        if class_name in excluded:
+        if class_name == "background":
             continue
 
         mask = labels == class_id
@@ -1121,347 +1253,100 @@ def rank_subjects(
             np.mean(ys) / h
         )
 
-        center = 1.0 - min(
-            1.0,
-            math.sqrt(
-                (cx - 0.5) ** 2
-                +
-                (cy - 0.5) ** 2
-            ) * 1.5
-        )
-
-        mean_conf = float(
+        conf = float(
             np.mean(
                 confidence[mask]
             )
         )
 
-        mean_saliency = float(
+        sal = float(
             np.mean(
                 saliency[mask]
             )
         )
 
-        local_lum = luminance(rgb)
+        lum = (
+            0.2126 * rgb[:, :, 0] +
+            0.7152 * rgb[:, :, 1] +
+            0.0722 * rgb[:, :, 2]
+        )
 
-        region_lum = (
-            local_lum[mask]
+        local_mean = cv2.GaussianBlur(
+            lum,
+            (0, 0),
+            9,
         )
 
         local_contrast = float(
-            np.std(region_lum)
-        )
-
-        hsv = cv2.cvtColor(
-            np.clip(
-                rgb * 255,
-                0,
-                255,
-            ).astype(np.uint8),
-            cv2.COLOR_RGB2HSV,
+            np.mean(
+                np.abs(
+                    lum[mask] -
+                    local_mean[mask]
+                )
+            )
         )
 
         colorfulness = float(
             np.mean(
-                hsv[..., 1][mask]
-            ) / 255.0
-        )
-
-        score = (
-            mean_conf * 0.35
-            +
-            math.sqrt(area) * 0.20
-            +
-            center * 0.15
-            +
-            mean_saliency * 0.15
-            +
-            min(local_contrast * 5, 1)
-            * 0.10
-            +
-            colorfulness * 0.05
-        )
-
-        score *= priors.get(
-            class_name,
-            1.0,
-        )
-
-        subjects.append(
-            SubjectCandidate(
-                class_name=class_name,
-                confidence=mean_conf,
-                area=area,
-                center=(cx, cy),
-                saliency=mean_saliency,
-                local_contrast=local_contrast,
-                colorfulness=colorfulness,
-                score=score,
+                saturation[mask]
             )
         )
 
-    subjects.sort(
+        center_distance = math.sqrt(
+            (cx - 0.5) ** 2 +
+            (cy - 0.5) ** 2
+        )
+
+        center_score = max(
+            0.0,
+            1.0 - center_distance / 0.707
+        )
+
+        prior = 1.0
+
+        if class_name == "person":
+            prior = 1.15
+        elif class_name in ANIMAL_CLASSES:
+            prior = 1.05
+        elif class_name in VEHICLE_CLASSES:
+            prior = 1.0
+        elif class_name in PLANT_CLASSES:
+            prior = 0.90
+        elif class_name == "bottle":
+            prior = 0.85
+
+        score = prior * (
+            0.30 * conf +
+            0.15 * math.sqrt(area) +
+            0.15 * center_score +
+            0.20 * sal +
+            0.10 * min(
+                local_contrast * 5.0,
+                1.0
+            ) +
+            0.10 * colorfulness
+        )
+
+        candidates.append(
+            SubjectCandidate(
+                class_name=class_name,
+                confidence=conf,
+                area=area,
+                center_x=cx,
+                center_y=cy,
+                saliency=sal,
+                local_contrast=local_contrast,
+                colorfulness=colorfulness,
+                score=float(score),
+            )
+        )
+
+    candidates.sort(
         key=lambda x: x.score,
         reverse=True,
     )
 
-    return subjects[:10]
-
-
-# ============================================================
-# Region masks
-# ============================================================
-
-def make_region_masks(
-    rgb,
-    labels,
-):
-
-    h, w = labels.shape
-
-    masks = {}
-
-    person = (
-        labels ==
-        SemanticSegmenter.VOC_CLASSES.index(
-            "person"
-        )
-    )
-
-    animal_ids = [
-        SemanticSegmenter.VOC_CLASSES.index(x)
-        for x in [
-            "cat",
-            "dog",
-            "horse",
-            "cow",
-            "sheep",
-            "bird",
-        ]
-    ]
-
-    vehicle_ids = [
-        SemanticSegmenter.VOC_CLASSES.index(x)
-        for x in [
-            "car",
-            "bus",
-            "train",
-            "boat",
-            "bicycle",
-            "motorbike",
-        ]
-    ]
-
-    plant = (
-        labels ==
-        SemanticSegmenter.VOC_CLASSES.index(
-            "pottedplant"
-        )
-    )
-
-    animal = np.isin(
-        labels,
-        animal_ids,
-    )
-
-    vehicle = np.isin(
-        labels,
-        vehicle_ids,
-    )
-
-    subject = (
-        person
-        |
-        animal
-        |
-        vehicle
-        |
-        plant
-    )
-
-    hsv = cv2.cvtColor(
-        np.clip(
-            rgb * 255,
-            0,
-            255,
-        ).astype(np.uint8),
-        cv2.COLOR_RGB2HSV,
-    )
-
-    H = hsv[..., 0]
-    S = hsv[..., 1]
-    V = hsv[..., 2]
-
-    skin = (
-        person
-        &
-        (H >= 0)
-        &
-        (H <= 25)
-        &
-        (S >= 30)
-        &
-        (S <= 190)
-        &
-        (V >= 60)
-    )
-
-    green = (
-        (H >= 30)
-        &
-        (H <= 95)
-        &
-        (S >= 45)
-        &
-        (V >= 30)
-    )
-
-    blue = (
-        (H >= 80)
-        &
-        (H <= 135)
-        &
-        (S >= 40)
-        &
-        (V >= 40)
-    )
-
-    lum = luminance(rgb)
-
-    p75 = np.percentile(
-        lum,
-        75,
-    )
-
-    upper_bright = (
-        (
-            np.indices(
-                (h, w)
-            )[0]
-            <
-            h * 0.45
-        )
-        &
-        (lum > p75)
-    )
-
-    lower_half = (
-        np.indices(
-            (h, w)
-        )[0]
-        >
-        h * 0.50
-    )
-
-    gray = np.clip(
-        lum * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    gx = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3,
-    )
-
-    gy = cv2.Sobel(
-        gray,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3,
-    )
-
-    texture = cv2.magnitude(
-        gx,
-        gy,
-    )
-
-    water = (
-        blue
-        &
-        lower_half
-        &
-        (
-            texture
-            <
-            np.percentile(
-                texture,
-                55,
-            )
-        )
-    )
-
-    masks["person"] = person
-    masks["animal"] = animal
-    masks["vehicle"] = vehicle
-    masks["plant"] = plant
-    masks["subject"] = subject
-
-    masks["skin"] = skin
-    masks["green"] = green
-    masks["water"] = water
-    masks["upper_bright"] = upper_bright
-
-    return masks
-
-
-# ============================================================
-# Region statistics
-# ============================================================
-
-def calculate_region_stats(
-    rgb,
-    masks,
-):
-
-    hsv = cv2.cvtColor(
-        np.clip(
-            rgb * 255,
-            0,
-            255,
-        ).astype(np.uint8),
-        cv2.COLOR_RGB2HSV,
-    )
-
-    lum = luminance(rgb)
-
-    result = []
-
-    for name, mask in masks.items():
-
-        area = float(
-            np.mean(mask)
-        )
-
-        if area <= 0:
-            continue
-
-        mean_lum = float(
-            np.mean(
-                lum[mask]
-            )
-        )
-
-        mean_sat = float(
-            np.mean(
-                hsv[..., 1][mask]
-            ) / 255.0
-        )
-
-        result.append(
-            RegionStats(
-                name=name,
-                area=area,
-                mean_luminance=mean_lum,
-                mean_saturation=mean_sat,
-            )
-        )
-
-    return result
+    return candidates[:10]
 
 
 # ============================================================
@@ -1469,78 +1354,72 @@ def calculate_region_stats(
 # ============================================================
 
 def classify_scene(
-    stats,
-    shooting,
-    subjects,
-):
+    stats: ImageStats,
+    shooting: ShootingCondition,
+    subjects: List[SubjectCandidate],
+) -> SceneResult:
 
-    person_area = 0.0
-    vehicle_area = 0.0
+    person_area = sum(
+        x.area
+        for x in subjects
+        if x.class_name == "person"
+    )
 
-    for s in subjects:
-
-        if s.class_name == "person":
-            person_area += s.area
-
-        if s.class_name in {
-            "car",
-            "bus",
-            "train",
-            "boat",
-            "bicycle",
-            "motorbike",
-        }:
-            vehicle_area += s.area
+    vehicle_area = sum(
+        x.area
+        for x in subjects
+        if x.class_name in VEHICLE_CLASSES
+    )
 
     if (
-        person_area > 0.015
-        and stats.median > 0.08
+        person_area > 0.015 and
+        stats.median > 0.08
     ):
         return SceneResult(
             "portrait",
-            0.85,
-        )
-
-    if (
-        shooting.low_light
-        and stats.median < 0.10
-    ):
-        return SceneResult(
-            "night",
-            0.85,
-        )
-
-    if (
-        stats.warm_ratio > 0.18
-        and stats.p95 > 0.55
-    ):
-        return SceneResult(
-            "sunset",
             0.75,
         )
 
     if (
-        shooting.wide_angle
-        and stats.edge_density < 0.16
-        and stats.dynamic_range > 5
+        shooting.low_light and
+        stats.median < 0.10
+    ):
+        return SceneResult(
+            "night",
+            0.80,
+        )
+
+    if (
+        stats.warm_ratio > 0.18 and
+        stats.p95 > 0.55
+    ):
+        return SceneResult(
+            "sunset",
+            0.70,
+        )
+
+    if (
+        shooting.wide_angle and
+        stats.edge_density < 0.16 and
+        stats.dynamic_range > 5
     ):
         return SceneResult(
             "landscape",
-            0.70,
+            0.65,
         )
 
     if (
-        vehicle_area > 0.01
-        and stats.edge_density > 0.10
+        vehicle_area > 0.01 and
+        stats.edge_density > 0.10
     ):
         return SceneResult(
             "city",
-            0.70,
+            0.65,
         )
 
     if (
-        stats.median < 0.18
-        and stats.warm_ratio > 0.10
+        stats.median < 0.18 and
+        stats.warm_ratio > 0.10
     ):
         return SceneResult(
             "indoor",
@@ -1560,173 +1439,138 @@ def classify_scene(
 SCENE_PROFILES = {
 
     "portrait": DevelopParams(
-        0.05,
-        1.02,
-        0.97,
-
-        0.42,
-        0.08,
-
-        0.08,
-        1.02,
-        0.035,
-
-        0.55,
-        0.75,
-
-        0.94,
-        1.00,
-        0.06,
-        0.12,
-
-        0.55,
+        exposure_ev=0.05,
+        contrast=1.02,
+        saturation=0.97,
+        highlight_protection=0.42,
+        shadow_lift=0.08,
+        subject_exposure=0.08,
+        subject_contrast=1.02,
+        background_suppression=0.035,
+        denoise=0.55,
+        sharpen=0.75,
+        region_skin_saturation=0.94,
+        region_green_saturation=1.00,
+        region_water_highlight=0.06,
+        region_upper_highlight=0.12,
+        tone_strength=0.55,
     ),
 
     "night": DevelopParams(
-        0.00,
-        1.05,
-        1.03,
-
-        0.55,
-        0.02,
-
-        0.05,
-        1.03,
-        0.015,
-
-        0.85,
-        0.45,
-
-        0.94,
-        1.00,
-        0.10,
-        0.18,
-
-        0.45,
+        exposure_ev=0.0,
+        contrast=1.05,
+        saturation=1.03,
+        highlight_protection=0.55,
+        shadow_lift=0.02,
+        subject_exposure=0.05,
+        subject_contrast=1.03,
+        background_suppression=0.015,
+        denoise=0.85,
+        sharpen=0.45,
+        region_skin_saturation=0.94,
+        region_green_saturation=1.00,
+        region_water_highlight=0.10,
+        region_upper_highlight=0.18,
+        tone_strength=0.45,
     ),
 
     "sunset": DevelopParams(
-        -0.05,
-        1.06,
-        1.08,
-
-        0.55,
-        0.04,
-
-        0.05,
-        1.03,
-        0.015,
-
-        0.30,
-        0.80,
-
-        0.96,
-        1.02,
-        0.10,
-        0.20,
-
-        0.60,
+        exposure_ev=-0.05,
+        contrast=1.06,
+        saturation=1.08,
+        highlight_protection=0.55,
+        shadow_lift=0.04,
+        subject_exposure=0.05,
+        subject_contrast=1.03,
+        background_suppression=0.015,
+        denoise=0.30,
+        sharpen=0.80,
+        region_skin_saturation=0.96,
+        region_green_saturation=1.02,
+        region_water_highlight=0.10,
+        region_upper_highlight=0.20,
+        tone_strength=0.60,
     ),
 
     "landscape": DevelopParams(
-        0.03,
-        1.08,
-        1.04,
-
-        0.40,
-        0.08,
-
-        0.06,
-        1.03,
-        0.015,
-
-        0.30,
-        0.85,
-
-        0.96,
-        1.03,
-        0.10,
-        0.18,
-
-        0.60,
+        exposure_ev=0.03,
+        contrast=1.08,
+        saturation=1.04,
+        highlight_protection=0.40,
+        shadow_lift=0.08,
+        subject_exposure=0.06,
+        subject_contrast=1.03,
+        background_suppression=0.015,
+        denoise=0.30,
+        sharpen=0.85,
+        region_skin_saturation=0.96,
+        region_green_saturation=1.03,
+        region_water_highlight=0.10,
+        region_upper_highlight=0.18,
+        tone_strength=0.60,
     ),
 
     "city": DevelopParams(
-        0.02,
-        1.07,
-        1.02,
-
-        0.45,
-        0.05,
-
-        0.06,
-        1.03,
-        0.02,
-
-        0.40,
-        0.80,
-
-        0.95,
-        1.01,
-        0.08,
-        0.16,
-
-        0.58,
+        exposure_ev=0.02,
+        contrast=1.07,
+        saturation=1.02,
+        highlight_protection=0.45,
+        shadow_lift=0.05,
+        subject_exposure=0.06,
+        subject_contrast=1.03,
+        background_suppression=0.02,
+        denoise=0.40,
+        sharpen=0.80,
+        region_skin_saturation=0.95,
+        region_green_saturation=1.01,
+        region_water_highlight=0.08,
+        region_upper_highlight=0.16,
+        tone_strength=0.58,
     ),
 
     "indoor": DevelopParams(
-        0.04,
-        1.03,
-        0.99,
-
-        0.40,
-        0.08,
-
-        0.05,
-        1.02,
-        0.015,
-
-        0.50,
-        0.65,
-
-        0.94,
-        1.00,
-        0.05,
-        0.10,
-
-        0.50,
+        exposure_ev=0.04,
+        contrast=1.03,
+        saturation=0.99,
+        highlight_protection=0.40,
+        shadow_lift=0.08,
+        subject_exposure=0.05,
+        subject_contrast=1.02,
+        background_suppression=0.015,
+        denoise=0.50,
+        sharpen=0.65,
+        region_skin_saturation=0.94,
+        region_green_saturation=1.00,
+        region_water_highlight=0.05,
+        region_upper_highlight=0.10,
+        tone_strength=0.50,
     ),
 
     "general": DevelopParams(
-        0.00,
-        1.04,
-        1.00,
-
-        0.35,
-        0.06,
-
-        0.04,
-        1.02,
-        0.015,
-
-        0.30,
-        0.75,
-
-        0.96,
-        1.01,
-        0.07,
-        0.12,
-
-        0.52,
+        exposure_ev=0.0,
+        contrast=1.04,
+        saturation=1.00,
+        highlight_protection=0.35,
+        shadow_lift=0.06,
+        subject_exposure=0.04,
+        subject_contrast=1.02,
+        background_suppression=0.015,
+        denoise=0.30,
+        sharpen=0.75,
+        region_skin_saturation=0.96,
+        region_green_saturation=1.01,
+        region_water_highlight=0.07,
+        region_upper_highlight=0.12,
+        tone_strength=0.52,
     ),
 }
 
 
 # ============================================================
-# Auto exposure
+# Exposure estimation
 # ============================================================
 
-TARGET_MEDIAN = {
+TARGET_MEDIANS = {
     "portrait": 0.18,
     "night": 0.08,
     "sunset": 0.14,
@@ -1738,11 +1582,11 @@ TARGET_MEDIAN = {
 
 
 def estimate_exposure(
-    stats,
-    scene,
-):
+    stats: ImageStats,
+    scene: str,
+) -> float:
 
-    target = TARGET_MEDIAN.get(
+    target = TARGET_MEDIANS.get(
         scene,
         0.18,
     )
@@ -1752,430 +1596,87 @@ def estimate_exposure(
         1e-4,
     )
 
+    p95 = max(
+        stats.p95,
+        1e-4,
+    )
+
     ev_mid = math.log2(
         target / median
     )
 
     ev_high = math.log2(
-        0.72 /
-        max(stats.p95, 1e-4)
+        0.72 / p95
     )
 
     ev = (
-        ev_mid * 0.60
-        +
-        ev_high * 0.40
+        0.60 * ev_mid +
+        0.40 * ev_high
     )
 
-    return clamp(
-        ev,
-        -0.75,
-        0.75,
+    return float(
+        np.clip(
+            ev,
+            -0.75,
+            0.75,
+        )
     )
 
 
 # ============================================================
-# Tone mapping
+# Exposure application
 # ============================================================
 
-def tone_map_luminance(
-    linear_rgb,
-    exposure_ev,
-    contrast,
-    highlight_protection,
-    shadow_lift,
-    tone_strength,
-):
+def apply_exposure(
+    linear_rgb: np.ndarray,
+    ev: float,
+) -> np.ndarray:
 
-    rgb = np.clip(
-        linear_rgb,
-        0,
-        None,
+    gain = 2.0 ** ev
+
+    return np.clip(
+        linear_rgb * gain,
+        0.0,
+        1.0,
     )
 
-    lum = luminance(rgb)
 
-    exposure = 2.0 ** exposure_ev
+# ============================================================
+# Global contrast
+# ============================================================
 
-    rgb = rgb * exposure
-
-    lum = luminance(rgb)
-
-    # --------------------------------------------------------
-    # Shadow lift
-    # --------------------------------------------------------
-
-    shadow_mask = np.clip(
-        1.0 -
-        lum / 0.25,
-        0,
-        1,
-    )
-
-    lift = (
-        shadow_mask
-        *
-        shadow_lift
-        *
-        0.12
-    )
-
-    lum = lum + lift
-
-    # --------------------------------------------------------
-    # Highlight rolloff
-    # --------------------------------------------------------
-
-    high_mask = np.clip(
-        (lum - 0.55) / 0.45,
-        0,
-        1,
-    )
-
-    roll = (
-        high_mask
-        *
-        highlight_protection
-        *
-        0.20
-    )
-
-    lum = lum - roll
-
-    # --------------------------------------------------------
-    # Contrast
-    # --------------------------------------------------------
-
-    pivot = 0.18
+def apply_contrast(
+    linear_rgb: np.ndarray,
+    contrast: float,
+) -> np.ndarray:
 
     lum = (
-        (lum - pivot)
-        * contrast
-        +
-        pivot
+        0.2126 * linear_rgb[:, :, 0] +
+        0.7152 * linear_rgb[:, :, 1] +
+        0.0722 * linear_rgb[:, :, 2]
     )
 
-    lum = np.clip(
-        lum,
-        0,
-        1,
+    mean_lum = float(
+        np.median(lum)
     )
 
-    # --------------------------------------------------------
-    # Mild S curve
-    # --------------------------------------------------------
-
-    if tone_strength > 0:
-
-        x = lum
-
-        s_curve = (
-            x
-            +
-            tone_strength
-            *
-            (
-                x * (1 - x)
-                *
-                (x - 0.5)
-                *
-                0.45
-            )
-        )
-
-        lum = np.clip(
-            s_curve,
-            0,
-            1,
-        )
-
-    old_lum = luminance(
-        np.maximum(rgb, 1e-8)
+    new_lum = (
+        (lum - mean_lum) *
+        contrast +
+        mean_lum
     )
 
-    scale = (
-        lum /
-        np.maximum(
-            old_lum,
-            1e-6,
-        )
+    ratio = (
+        new_lum /
+        np.maximum(lum, 1e-5)
     )
 
-    result = rgb * scale[..., None]
+    result = linear_rgb * ratio[:, :, None]
 
     return np.clip(
         result,
-        0,
-        1,
-    )
-
-
-# ============================================================
-# Region adjustments
-# ============================================================
-
-def apply_region_adjustments(
-    linear_rgb,
-    masks,
-    params,
-):
-
-    rgb = linear_rgb.copy()
-
-    lum = luminance(rgb)
-
-    # --------------------------------------------------------
-    # Subject
-    # --------------------------------------------------------
-
-    subject = masks.get(
-        "subject"
-    )
-
-    if subject is not None and np.any(subject):
-
-        factor = (
-            2.0 **
-            params.subject_exposure
-        )
-
-        rgb[subject] *= factor
-
-        subject_lum = luminance(
-            rgb[subject]
-        )
-
-        mean_subject = float(
-            np.mean(subject_lum)
-        )
-
-        adjusted = (
-            (subject_lum - mean_subject)
-            *
-            params.subject_contrast
-            +
-            mean_subject
-        )
-
-        ratio = (
-            adjusted /
-            np.maximum(
-                subject_lum,
-                1e-6,
-            )
-        )
-
-        rgb[subject] *= (
-            ratio[:, None]
-        )
-
-    # --------------------------------------------------------
-    # Skin saturation
-    # --------------------------------------------------------
-
-    skin = masks.get(
-        "skin"
-    )
-
-    if skin is not None and np.any(skin):
-
-        local = rgb[skin]
-
-        l = (
-            0.2126 * local[:, 0]
-            +
-            0.7152 * local[:, 1]
-            +
-            0.0722 * local[:, 2]
-        )
-
-        local = (
-            l[:, None]
-            +
-            (
-                local
-                -
-                l[:, None]
-            )
-            *
-            params.region_skin_saturation
-        )
-
-        rgb[skin] = np.clip(
-            local,
-            0,
-            1,
-        )
-
-    # --------------------------------------------------------
-    # Green
-    # --------------------------------------------------------
-
-    green = masks.get(
-        "green"
-    )
-
-    if green is not None and np.any(green):
-
-        local = rgb[green]
-
-        l = (
-            0.2126 * local[:, 0]
-            +
-            0.7152 * local[:, 1]
-            +
-            0.0722 * local[:, 2]
-        )
-
-        local = (
-            l[:, None]
-            +
-            (
-                local
-                -
-                l[:, None]
-            )
-            *
-            params.region_green_saturation
-        )
-
-        rgb[green] = np.clip(
-            local,
-            0,
-            1,
-        )
-
-    # --------------------------------------------------------
-    # Water
-    # --------------------------------------------------------
-
-    water = masks.get(
-        "water"
-    )
-
-    if water is not None and np.any(water):
-
-        local = rgb[water]
-
-        l = (
-            0.2126 * local[:, 0]
-            +
-            0.7152 * local[:, 1]
-            +
-            0.0722 * local[:, 2]
-        )
-
-        local = (
-            l[:, None]
-            +
-            (
-                local
-                -
-                l[:, None]
-            )
-            * 1.02
-        )
-
-        rgb[water] = np.clip(
-            local,
-            0,
-            1,
-        )
-
-        wl = luminance(
-            rgb[water]
-        )
-
-        protection = (
-            np.clip(
-                (wl - 0.65) / 0.35,
-                0,
-                1,
-            )
-            *
-            params.region_water_highlight
-        )
-
-        rgb[water] *= (
-            1.0 - protection[:, None]
-        )
-
-    # --------------------------------------------------------
-    # Upper bright region
-    # --------------------------------------------------------
-
-    upper = masks.get(
-        "upper_bright"
-    )
-
-    if upper is not None and np.any(upper):
-
-        ul = luminance(
-            rgb[upper]
-        )
-
-        protection = (
-            np.clip(
-                (ul - 0.60) / 0.40,
-                0,
-                1,
-            )
-            *
-            params.region_upper_highlight
-        )
-
-        rgb[upper] *= (
-            1.0 -
-            protection[:, None] *
-            0.20
-        )
-
-    # --------------------------------------------------------
-    # Background suppression
-    # --------------------------------------------------------
-
-    if subject is not None and np.any(subject):
-
-        background = ~subject
-
-        if np.any(background):
-
-            local = rgb[background]
-
-            l = (
-                0.2126 * local[:, 0]
-                +
-                0.7152 * local[:, 1]
-                +
-                0.0722 * local[:, 2]
-            )
-
-            local = (
-                l[:, None]
-                +
-                (
-                    local
-                    -
-                    l[:, None]
-                )
-                *
-                (
-                    1.0
-                    -
-                    params.background_suppression
-                )
-            )
-
-            rgb[background] = np.clip(
-                local,
-                0,
-                1,
-            )
-
-    return np.clip(
-        rgb,
-        0,
-        1,
+        0.0,
+        1.0,
     )
 
 
@@ -2184,34 +1685,525 @@ def apply_region_adjustments(
 # ============================================================
 
 def apply_saturation(
-    linear_rgb,
-    saturation,
-):
+    linear_rgb: np.ndarray,
+    saturation: float,
+) -> np.ndarray:
 
-    rgb = np.clip(
-        linear_rgb,
-        0,
-        1,
+    lum = (
+        0.2126 * linear_rgb[:, :, 0] +
+        0.7152 * linear_rgb[:, :, 1] +
+        0.0722 * linear_rgb[:, :, 2]
     )
 
-    lum = luminance(rgb)
-
     result = (
-        lum[..., None]
-        +
+        lum[:, :, None] +
         (
-            rgb
-            -
-            lum[..., None]
-        )
-        *
-        saturation
+            linear_rgb -
+            lum[:, :, None]
+        ) * saturation
     )
 
     return np.clip(
         result,
-        0,
-        1,
+        0.0,
+        1.0,
+    )
+
+
+# ============================================================
+# Tone curve
+# ============================================================
+
+def apply_tone(
+    linear_rgb: np.ndarray,
+    params: DevelopParams,
+) -> np.ndarray:
+
+    lum = (
+        0.2126 * linear_rgb[:, :, 0] +
+        0.7152 * linear_rgb[:, :, 1] +
+        0.0722 * linear_rgb[:, :, 2]
+    )
+
+    strength = params.tone_strength
+
+    # Shadow lift
+    shadow_mask = np.clip(
+        (0.25 - lum) / 0.25,
+        0.0,
+        1.0,
+    )
+
+    lifted = (
+        lum +
+        params.shadow_lift *
+        shadow_mask *
+        (1.0 - lum)
+    )
+
+    # Highlight rolloff
+    highlight_mask = np.clip(
+        (lum - 0.65) / 0.35,
+        0.0,
+        1.0,
+    )
+
+    rolled = (
+        lifted -
+        params.highlight_protection *
+        highlight_mask *
+        np.maximum(
+            lifted - 0.65,
+            0.0
+        ) *
+        0.45
+    )
+
+    # Mild S curve
+    centered = rolled - 0.5
+
+    curve = (
+        centered *
+        (
+            1.0 +
+            strength *
+            0.20 *
+            (
+                1.0 -
+                4.0 *
+                centered *
+                centered
+            )
+        )
+    )
+
+    new_lum = np.clip(
+        0.5 + curve,
+        0.0,
+        1.0,
+    )
+
+    ratio = (
+        new_lum /
+        np.maximum(
+            lum,
+            1e-5
+        )
+    )
+
+    result = (
+        linear_rgb *
+        ratio[:, :, None]
+    )
+
+    return np.clip(
+        result,
+        0.0,
+        1.0,
+    )
+
+
+# ============================================================
+# Region masks
+# ============================================================
+
+def create_region_masks(
+    rgb: np.ndarray,
+    labels: np.ndarray,
+    subjects: List[SubjectCandidate],
+) -> Dict[str, np.ndarray]:
+
+    h, w = labels.shape
+
+    person = (
+        labels ==
+        VOC_CLASSES.index("person")
+    )
+
+    animal = np.zeros(
+        (h, w),
+        dtype=bool,
+    )
+
+    for name in ANIMAL_CLASSES:
+        animal |= (
+            labels ==
+            VOC_CLASSES.index(name)
+        )
+
+    vehicle = np.zeros(
+        (h, w),
+        dtype=bool,
+    )
+
+    for name in VEHICLE_CLASSES:
+        vehicle |= (
+            labels ==
+            VOC_CLASSES.index(name)
+        )
+
+    plant = np.zeros(
+        (h, w),
+        dtype=bool,
+    )
+
+    for name in PLANT_CLASSES:
+        plant |= (
+            labels ==
+            VOC_CLASSES.index(name)
+        )
+
+    subject = (
+        person |
+        animal |
+        vehicle |
+        plant
+    )
+
+    hsv = cv2.cvtColor(
+        (rgb * 255).astype(np.uint8),
+        cv2.COLOR_RGB2HSV,
+    )
+
+    h_channel = hsv[:, :, 0]
+    s_channel = hsv[:, :, 1]
+    v_channel = hsv[:, :, 2]
+
+    skin = (
+        person &
+        (
+            (
+                h_channel >= 0
+            ) &
+            (
+                h_channel <= 25
+            )
+        ) &
+        (s_channel >= 30) &
+        (s_channel <= 190) &
+        (v_channel >= 50)
+    )
+
+    green = (
+        (h_channel >= 30) &
+        (h_channel <= 95) &
+        (s_channel >= 45) &
+        (v_channel >= 30)
+    )
+
+    blue = (
+        (h_channel >= 80) &
+        (h_channel <= 135) &
+        (s_channel >= 40) &
+        (v_channel >= 40)
+    )
+
+    lum = (
+        0.2126 * rgb[:, :, 0] +
+        0.7152 * rgb[:, :, 1] +
+        0.0722 * rgb[:, :, 2]
+    )
+
+    p75 = np.percentile(
+        lum,
+        75,
+    )
+
+    yy = np.arange(h)[:, None]
+
+    upper_bright = (
+        (yy < h * 0.45) &
+        (lum > p75)
+    )
+
+    lower_half = (
+        yy >= h * 0.50
+    )
+
+    local_std = cv2.GaussianBlur(
+        (lum * lum).astype(np.float32),
+        (0, 0),
+        5,
+    ) - (
+        cv2.GaussianBlur(
+            lum,
+            (0, 0),
+            5,
+        ) ** 2
+    )
+
+    water = (
+        blue &
+        lower_half &
+        (
+            local_std < 0.02
+        )
+    )
+
+    return {
+        "person": person,
+        "animal": animal,
+        "vehicle": vehicle,
+        "plant": plant,
+        "subject": subject,
+        "skin": skin,
+        "green": green,
+        "blue": blue,
+        "upper_bright": upper_bright,
+        "water": water,
+    }
+
+
+# ============================================================
+# Region statistics
+# ============================================================
+
+def calculate_region_stats(
+    rgb: np.ndarray,
+    masks: Dict[str, np.ndarray],
+) -> List[RegionStats]:
+
+    hsv = cv2.cvtColor(
+        (rgb * 255).astype(np.uint8),
+        cv2.COLOR_RGB2HSV,
+    )
+
+    saturation = (
+        hsv[:, :, 1].astype(np.float32)
+        / 255.0
+    )
+
+    lum = (
+        0.2126 * rgb[:, :, 0] +
+        0.7152 * rgb[:, :, 1] +
+        0.0722 * rgb[:, :, 2]
+    )
+
+    result = []
+
+    total = rgb.shape[0] * rgb.shape[1]
+
+    for name, mask in masks.items():
+
+        area = float(
+            np.sum(mask) /
+            max(total, 1)
+        )
+
+        if not np.any(mask):
+            mean_lum = 0.0
+            mean_sat = 0.0
+        else:
+            mean_lum = float(
+                np.mean(
+                    lum[mask]
+                )
+            )
+
+            mean_sat = float(
+                np.mean(
+                    saturation[mask]
+                )
+            )
+
+        result.append(
+            RegionStats(
+                name=name,
+                area=area,
+                mean_luminance=mean_lum,
+                mean_saturation=mean_sat,
+            )
+        )
+
+    return result
+
+
+# ============================================================
+# Region development
+# ============================================================
+
+def apply_region_development(
+    linear_rgb: np.ndarray,
+    masks: Dict[str, np.ndarray],
+    params: DevelopParams,
+) -> np.ndarray:
+
+    result = linear_rgb.copy()
+
+    if np.any(masks["subject"]):
+
+        subject = masks["subject"]
+
+        gain = (
+            2.0 **
+            params.subject_exposure
+        )
+
+        result[subject] *= gain
+
+    if np.any(masks["subject"]):
+
+        subject = masks["subject"]
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        mean_lum = float(
+            np.mean(
+                lum[subject]
+            )
+        )
+
+        new_lum = (
+            (
+                lum -
+                mean_lum
+            ) *
+            params.subject_contrast +
+            mean_lum
+        )
+
+        ratio = (
+            new_lum /
+            np.maximum(
+                lum,
+                1e-5,
+            )
+        )
+
+        temp = (
+            result *
+            ratio[:, :, None]
+        )
+
+        result[subject] = (
+            temp[subject]
+        )
+
+    if np.any(masks["skin"]):
+
+        skin = masks["skin"]
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        temp = (
+            lum[:, :, None] +
+            (
+                result -
+                lum[:, :, None]
+            ) *
+            params.region_skin_saturation
+        )
+
+        result[skin] = (
+            temp[skin]
+        )
+
+    if np.any(masks["green"]):
+
+        green = masks["green"]
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        temp = (
+            lum[:, :, None] +
+            (
+                result -
+                lum[:, :, None]
+            ) *
+            params.region_green_saturation
+        )
+
+        result[green] = (
+            temp[green]
+        )
+
+    if np.any(masks["water"]):
+
+        water = masks["water"]
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        highlight = np.clip(
+            (lum - 0.55) / 0.45,
+            0.0,
+            1.0,
+        )
+
+        result[water] *= (
+            1.0 -
+            params.region_water_highlight *
+            highlight[water, None]
+        )
+
+    if np.any(masks["upper_bright"]):
+
+        upper = masks["upper_bright"]
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        highlight = np.clip(
+            (lum - 0.55) / 0.45,
+            0.0,
+            1.0,
+        )
+
+        result[upper] *= (
+            1.0 -
+            params.region_upper_highlight *
+            highlight[upper, None]
+        )
+
+    # Background suppression
+    background = ~masks["subject"]
+
+    if np.any(background):
+
+        lum = (
+            0.2126 * result[:, :, 0] +
+            0.7152 * result[:, :, 1] +
+            0.0722 * result[:, :, 2]
+        )
+
+        temp = (
+            lum[:, :, None] +
+            (
+                result -
+                lum[:, :, None]
+            ) *
+            (
+                1.0 -
+                params.background_suppression
+            )
+        )
+
+        result[background] = (
+            temp[background]
+        )
+
+    return np.clip(
+        result,
+        0.0,
+        1.0,
     )
 
 
@@ -2220,11 +2212,11 @@ def apply_saturation(
 # ============================================================
 
 def apply_denoise(
-    linear_rgb,
-    strength,
-):
+    linear_rgb: np.ndarray,
+    strength: float,
+) -> np.ndarray:
 
-    if strength <= 0:
+    if strength <= 0.01:
         return linear_rgb
 
     srgb = linear_to_srgb(
@@ -2232,39 +2224,37 @@ def apply_denoise(
     )
 
     img8 = np.clip(
-        srgb * 255,
+        srgb * 255.0,
         0,
         255,
     ).astype(np.uint8)
 
-    sigma_color = (
-        10
-        +
-        strength * 30
+    sigma_space = (
+        2.0 +
+        strength * 4.0
     )
 
-    sigma_space = (
-        2
-        +
-        strength * 2
+    sigma_color = (
+        15.0 +
+        strength * 35.0
     )
 
     filtered = cv2.bilateralFilter(
         img8,
-        d=7,
+        d=5,
         sigmaColor=sigma_color,
         sigmaSpace=sigma_space,
     )
 
     filtered = (
-        filtered.astype(
-            np.float32
-        )
+        filtered.astype(np.float32)
         / 255.0
     )
 
-    return srgb_to_linear(
-        filtered
+    return np.clip(
+        srgb_to_linear(filtered),
+        0.0,
+        1.0,
     )
 
 
@@ -2273,47 +2263,44 @@ def apply_denoise(
 # ============================================================
 
 def apply_sharpen(
-    linear_rgb,
-    strength,
-):
+    linear_rgb: np.ndarray,
+    strength: float,
+) -> np.ndarray:
 
-    if strength <= 0:
+    if strength <= 0.01:
         return linear_rgb
 
     srgb = linear_to_srgb(
         linear_rgb
     )
 
-    lum = luminance(
-        srgb
+    lum = (
+        0.2126 * srgb[:, :, 0] +
+        0.7152 * srgb[:, :, 1] +
+        0.0722 * srgb[:, :, 2]
     )
 
     blur = cv2.GaussianBlur(
         lum,
         (0, 0),
+        1.2,
+    )
+
+    detail = (
+        lum - blur
+    )
+
+    sharpened_lum = np.clip(
+        lum +
+        detail *
+        strength *
+        1.2,
+        0.0,
         1.0,
     )
 
-    amount = (
-        0.35
-        *
-        strength
-    )
-
-    sharp_lum = (
-        lum
-        +
-        amount
-        *
-        (
-            lum
-            -
-            blur
-        )
-    )
-
     ratio = (
-        sharp_lum /
+        sharpened_lum /
         np.maximum(
             lum,
             1e-5,
@@ -2321,209 +2308,212 @@ def apply_sharpen(
     )
 
     result = (
-        srgb
-        *
-        ratio[..., None]
+        srgb *
+        ratio[:, :, None]
     )
 
     result = np.clip(
         result,
-        0,
-        1,
+        0.0,
+        1.0,
     )
 
-    return srgb_to_linear(
-        result
+    return np.clip(
+        srgb_to_linear(result),
+        0.0,
+        1.0,
     )
 
 
 # ============================================================
-# Render
+# Development
 # ============================================================
 
-def render_image(
-    linear_rgb,
-    masks,
-    params,
-):
+def develop(
+    linear_rgb: np.ndarray,
+    params: DevelopParams,
+    masks: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
 
-    result = tone_map_luminance(
+    stages = {}
+
+    # 1. Exposure
+    x = apply_exposure(
         linear_rgb,
-
         params.exposure_ev,
-        params.contrast,
-
-        params.highlight_protection,
-        params.shadow_lift,
-
-        params.tone_strength,
     )
 
-    result = apply_region_adjustments(
-        result,
+    stages["after_exposure"] = x.copy()
+
+    # 2. Contrast
+    x = apply_contrast(
+        x,
+        params.contrast,
+    )
+
+    stages["after_contrast"] = x.copy()
+
+    # 3. Saturation
+    x = apply_saturation(
+        x,
+        params.saturation,
+    )
+
+    stages["after_saturation"] = x.copy()
+
+    # 4. Tone
+    x = apply_tone(
+        x,
+        params,
+    )
+
+    stages["after_tone"] = x.copy()
+
+    # 5. Region processing
+    x = apply_region_development(
+        x,
         masks,
         params,
     )
 
-    result = apply_saturation(
-        result,
-        params.saturation,
-    )
+    stages["after_region"] = x.copy()
 
-    result = apply_denoise(
-        result,
+    # 6. Denoise
+    x = apply_denoise(
+        x,
         params.denoise,
     )
 
-    result = apply_sharpen(
-        result,
+    stages["after_denoise"] = x.copy()
+
+    # 7. Sharpen
+    x = apply_sharpen(
+        x,
         params.sharpen,
     )
 
-    return np.clip(
-        result,
-        0,
-        1,
-    )
+    stages["after_sharpen"] = x.copy()
+
+    stages["final_linear"] = x.copy()
+
+    return stages
 
 
 # ============================================================
-# Automatic parameter search
+# Automatic search
 # ============================================================
 
-def evaluate_render(
-    linear_rgb,
-    scene,
-    params,
-):
+def resize_for_search(
+    rgb: np.ndarray,
+    max_dim: int = 512,
+) -> np.ndarray:
 
-    small_h = min(
-        512,
-        linear_rgb.shape[0]
+    h, w = rgb.shape[:2]
+
+    scale = min(
+        1.0,
+        max_dim / max(h, w),
     )
 
-    scale = (
-        small_h /
-        linear_rgb.shape[0]
-    )
+    if scale >= 1.0:
+        return rgb
 
-    small = cv2.resize(
-        linear_rgb,
+    return cv2.resize(
+        rgb,
         (
-            int(
-                linear_rgb.shape[1]
-                *
-                scale
-            ),
-            small_h,
+            int(w * scale),
+            int(h * scale),
         ),
         interpolation=cv2.INTER_AREA,
     )
 
-    masks = {
-        "subject": np.zeros(
-            small.shape[:2],
-            dtype=bool
-        ),
-        "skin": np.zeros(
-            small.shape[:2],
-            dtype=bool
-        ),
-        "green": np.zeros(
-            small.shape[:2],
-            dtype=bool
-        ),
-        "water": np.zeros(
-            small.shape[:2],
-            dtype=bool
-        ),
-        "upper_bright": np.zeros(
-            small.shape[:2],
-            dtype=bool
-        ),
-    }
 
-    rendered = render_image(
-        small,
-        masks,
-        params,
+def search_score(
+    rgb: np.ndarray,
+    scene: str,
+) -> float:
+
+    stats = calculate_stats(
+        rgb
     )
 
-    stats = analyze_image(
-        rendered
-    )
-
-    target = TARGET_MEDIAN.get(
+    target = TARGET_MEDIANS.get(
         scene,
         0.18,
     )
 
-    mid_error = abs(
-        stats.median - target
-    )
-
-    highlight_penalty = (
-        stats.highlight_ratio
-        * 4.0
-    )
-
-    shadow_penalty = (
-        stats.shadow_ratio
-        * (
-            0.25
-            if scene == "night"
-            else 1.0
+    median_error = abs(
+        math.log(
+            max(stats.median, 1e-5) /
+            max(target, 1e-5)
         )
     )
 
     contrast_target = {
-        "portrait": 0.16,
-        "night": 0.12,
-        "sunset": 0.18,
-        "landscape": 0.20,
-        "city": 0.18,
-        "indoor": 0.15,
-        "general": 0.17,
+        "portrait": 0.18,
+        "night": 0.16,
+        "sunset": 0.22,
+        "landscape": 0.23,
+        "city": 0.22,
+        "indoor": 0.18,
+        "general": 0.20,
     }.get(
         scene,
-        0.17,
+        0.20,
     )
 
     contrast_error = abs(
-        stats.contrast
-        -
+        stats.contrast -
         contrast_target
     )
 
     oversaturation = max(
         0.0,
-        stats.saturation_ratio
-        -
-        0.08,
+        stats.saturation_ratio -
+        0.03,
     )
 
     score = (
-        mid_error * 0.65
-        +
-        highlight_penalty
-        +
-        shadow_penalty
-        +
-        contrast_error * 0.50
-        +
-        oversaturation * 0.80
+        4.0 *
+        stats.highlight_ratio +
+        1.0 *
+        stats.shadow_ratio +
+        0.65 *
+        median_error +
+        0.50 *
+        contrast_error +
+        0.80 *
+        oversaturation
     )
 
     return float(score)
 
 
-def search_parameters(
-    linear_rgb,
-    base_params,
-    scene,
-):
+def automatic_search(
+    linear_rgb: np.ndarray,
+    base_params: DevelopParams,
+    masks: Dict[str, np.ndarray],
+    scene: str,
+) -> Tuple[DevelopParams, float, List[Dict]]:
 
-    exposure_candidates = [
+    small = resize_for_search(
+        linear_rgb,
+        512,
+    )
+
+    small_masks = {}
+
+    for name, mask in masks.items():
+        small_masks[name] = cv2.resize(
+            mask.astype(np.uint8),
+            (
+                small.shape[1],
+                small.shape[0],
+            ),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+
+    ev_candidates = [
         -0.25,
         -0.12,
         0.0,
@@ -2544,294 +2534,442 @@ def search_parameters(
         1.03,
     ]
 
-    best_params = None
-    best_score = float("inf")
+    results = []
 
-    for ev_offset in exposure_candidates:
+    best_score = float("inf")
+    best_params = None
+
+    for ev_offset in ev_candidates:
 
         for contrast in contrast_candidates:
 
             for saturation in saturation_candidates:
 
                 params = DevelopParams(
-                    exposure_ev=clamp(
-                        base_params.exposure_ev
-                        +
-                        ev_offset,
-                        -1.0,
-                        1.0,
-                    ),
-
-                    contrast=contrast,
-
-                    saturation=(
-                        base_params.saturation
-                        *
-                        saturation
-                    ),
-
-                    highlight_protection=(
-                        base_params.highlight_protection
-                    ),
-
-                    shadow_lift=(
-                        base_params.shadow_lift
-                    ),
-
-                    subject_exposure=(
-                        base_params.subject_exposure
-                    ),
-
-                    subject_contrast=(
-                        base_params.subject_contrast
-                    ),
-
-                    background_suppression=(
-                        base_params.background_suppression
-                    ),
-
-                    denoise=(
-                        base_params.denoise
-                    ),
-
-                    sharpen=(
-                        base_params.sharpen
-                    ),
-
-                    region_skin_saturation=(
-                        base_params.region_skin_saturation
-                    ),
-
-                    region_green_saturation=(
-                        base_params.region_green_saturation
-                    ),
-
-                    region_water_highlight=(
-                        base_params.region_water_highlight
-                    ),
-
-                    region_upper_highlight=(
-                        base_params.region_upper_highlight
-                    ),
-
-                    tone_strength=(
-                        base_params.tone_strength
-                    ),
+                    **asdict(base_params)
                 )
 
-                score = evaluate_render(
-                    linear_rgb,
-                    scene,
+                params.exposure_ev += (
+                    ev_offset
+                )
+
+                params.contrast = contrast
+                params.saturation = saturation
+
+                stages = develop(
+                    small,
                     params,
+                    small_masks,
                 )
+
+                output = linear_to_srgb(
+                    stages["final_linear"]
+                )
+
+                score = search_score(
+                    output,
+                    scene,
+                )
+
+                results.append({
+                    "exposure_ev": params.exposure_ev,
+                    "contrast": params.contrast,
+                    "saturation": params.saturation,
+                    "score": score,
+                })
 
                 if score < best_score:
-
                     best_score = score
                     best_params = params
 
-    return best_params, best_score
+    results.sort(
+        key=lambda x: x["score"]
+    )
+
+    return (
+        best_params,
+        float(best_score),
+        results[:10],
+    )
 
 
 # ============================================================
-# Debug output
+# Debug report
 # ============================================================
 
-def save_debug(
-    debug_dir,
-    stem,
-    labels,
-    saliency,
-    masks,
+def save_debug_report(
+    debug_dir: Path,
+    input_path: Path,
+    output_path: Path,
+    metadata: ExifMetadata,
+    profile: CameraProfile,
+    raw_info: Dict,
+    shooting: ShootingCondition,
+    scene: SceneResult,
+    subjects: List[SubjectCandidate],
+    region_stats: List[RegionStats],
+    stage_stats: Dict[str, ImageStats],
+    params: DevelopParams,
+    search_score_value: float,
+    search_results: List[Dict],
 ):
 
-    debug_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+    report = {
+        "version": VERSION,
+
+        "input": str(input_path),
+        "output": str(output_path),
+
+        "metadata": asdict(metadata),
+        "camera_profile": asdict(profile),
+        "raw_info": raw_info,
+
+        "shooting_condition":
+            asdict(shooting),
+
+        "scene":
+            asdict(scene),
+
+        "subjects": [
+            asdict(x)
+            for x in subjects
+        ],
+
+        "regions": [
+            asdict(x)
+            for x in region_stats
+        ],
+
+        "stage_statistics": {
+            name: asdict(stats)
+            for name, stats in stage_stats.items()
+        },
+
+        "selected_parameters":
+            asdict(params),
+
+        "search": {
+            "best_score":
+                search_score_value,
+            "top_candidates":
+                search_results,
+        },
+    }
+
+    path = (
+        debug_dir /
+        "report.json"
     )
 
-    label_img = (
-        labels.astype(
-            np.uint8
-        )
-    )
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as f:
 
-    cv2.imwrite(
-        str(
-            debug_dir /
-            f"{stem}_segmentation.png"
-        ),
-        label_img,
-    )
-
-    saliency_img = np.clip(
-        saliency * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-
-    cv2.imwrite(
-        str(
-            debug_dir /
-            f"{stem}_saliency.png"
-        ),
-        saliency_img,
-    )
-
-    for name, mask in masks.items():
-
-        img = (
-            mask.astype(
-                np.uint8
-            )
-            *
-            255
-        )
-
-        cv2.imwrite(
-            str(
-                debug_dir /
-                f"{stem}_{name}.png"
-            ),
-            img,
+        json.dump(
+            report,
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
 
 
 # ============================================================
-# Main developer
+# Debug intermediate images
+# ============================================================
+
+def save_debug_images(
+    debug_dir: Path,
+    linear_rgb: np.ndarray,
+    stages: Dict[str, np.ndarray],
+    labels: Optional[np.ndarray],
+    confidence: Optional[np.ndarray],
+    saliency: Optional[np.ndarray],
+    masks: Optional[Dict[str, np.ndarray]],
+):
+
+    # --------------------------------------------------------
+    # 01. Original linear RAW output
+    # --------------------------------------------------------
+
+    save_rgb(
+        debug_dir /
+        "01_raw_linear.png",
+        linear_rgb,
+    )
+
+    # --------------------------------------------------------
+    # 02. Linear -> sRGB analysis image
+    # --------------------------------------------------------
+
+    analysis_srgb = linear_to_srgb(
+        linear_rgb
+    )
+
+    save_rgb(
+        debug_dir /
+        "02_analysis_srgb.png",
+        analysis_srgb,
+    )
+
+    # --------------------------------------------------------
+    # Development stages
+    # --------------------------------------------------------
+
+    stage_order = [
+        ("after_exposure", "03_after_exposure.png"),
+        ("after_contrast", "04_after_contrast.png"),
+        ("after_saturation", "05_after_saturation.png"),
+        ("after_tone", "06_after_tone.png"),
+        ("after_region", "07_after_region.png"),
+        ("after_denoise", "08_after_denoise.png"),
+        ("after_sharpen", "09_after_sharpen.png"),
+        ("final_linear", "10_final_linear.png"),
+    ]
+
+    for key, filename in stage_order:
+
+        if key in stages:
+
+            save_rgb(
+                debug_dir / filename,
+                linear_to_srgb(
+                    stages[key]
+                ),
+            )
+
+    # --------------------------------------------------------
+    # Segmentation
+    # --------------------------------------------------------
+
+    if labels is not None:
+
+        label_img = (
+            labels.astype(
+                np.float32
+            ) /
+            max(
+                len(VOC_CLASSES) - 1,
+                1,
+            )
+        )
+
+        save_gray(
+            debug_dir /
+            "11_segmentation.png",
+            label_img,
+        )
+
+    if confidence is not None:
+
+        save_gray(
+            debug_dir /
+            "12_segmentation_confidence.png",
+            confidence,
+        )
+
+    # --------------------------------------------------------
+    # Saliency
+    # --------------------------------------------------------
+
+    if saliency is not None:
+
+        save_gray(
+            debug_dir /
+            "13_saliency.png",
+            saliency,
+        )
+
+    # --------------------------------------------------------
+    # Masks
+    # --------------------------------------------------------
+
+    if masks is not None:
+
+        mask_names = [
+            "subject",
+            "person",
+            "animal",
+            "vehicle",
+            "plant",
+            "skin",
+            "green",
+            "blue",
+            "water",
+            "upper_bright",
+        ]
+
+        for index, name in enumerate(
+            mask_names,
+            start=14,
+        ):
+
+            if name in masks:
+
+                save_gray(
+                    debug_dir /
+                    f"{index:02d}_mask_{name}.png",
+                    masks[name].astype(
+                        np.float32
+                    ),
+                )
+
+
+# ============================================================
+# Developer
 # ============================================================
 
 class AutoDeveloper:
 
     def __init__(
         self,
-        device="auto",
-        debug=False,
+        device: str = "auto",
+        debug: bool = False,
     ):
 
         self.debug = debug
 
-        if device == "auto":
-
-            device = (
-                "cuda"
-                if torch.cuda.is_available()
-                else "cpu"
-            )
-
-        if (
-            device == "cuda"
-            and
-            not torch.cuda.is_available()
-        ):
-
-            print(
-                "[WARN] CUDA unavailable. "
-                "Using CPU."
-            )
-
-            device = "cpu"
-
-        self.device = device
-
-        print(
-            f"[INFO] v{VERSION}"
+        self.metadata_reader = (
+            MetadataReader()
         )
 
-        print(
-            f"[INFO] Device: "
-            f"{self.device}"
-        )
+        self.decoder = RawDecoder()
 
         self.segmenter = (
             SemanticSegmenter(
-                self.device
+                device=device
             )
         )
 
-    def process_file(
+    def process(
         self,
-        input_path,
-        output_path,
-        debug_dir=None,
+        input_path: Path,
+        output_path: Path,
+        debug_root: Optional[Path] = None,
     ):
 
         print(
-            f"[INFO] Processing: "
+            f"\n[INFO] Processing: "
             f"{input_path}"
         )
 
-        metadata = get_metadata(
-            input_path
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
+        metadata = (
+            self.metadata_reader.read(
+                input_path
+            )
         )
 
-        with rawpy.imread(
-            str(input_path)
-        ) as raw:
+        print(
+            f"[INFO] Camera: "
+            f"{metadata.make} "
+            f"{metadata.model}"
+        )
 
-            camera = make_camera_profile(
-                raw,
-                metadata,
+        print(
+            f"[INFO] ISO: "
+            f"{metadata.iso}"
+        )
+
+        print(
+            f"[INFO] Exposure: "
+            f"{metadata.exposure_time}"
+        )
+
+        # ----------------------------------------------------
+        # RAW
+        # ----------------------------------------------------
+
+        linear_rgb, profile, raw_info = (
+            self.decoder.load(
+                input_path
+            )
+        )
+
+        profile.make = (
+            metadata.make
+        )
+
+        profile.model = (
+            metadata.model
+        )
+
+        profile.family = (
+            detect_camera_family(
+                metadata.make,
+                metadata.model,
+            )
+        )
+
+        profile.iso = (
+            metadata.iso
+        )
+
+        profile.lens = (
+            metadata.lens_model
+        )
+
+        profile.metadata_source = (
+            metadata.source
+        )
+
+        # ----------------------------------------------------
+        # Debug: RAW linear
+        # ----------------------------------------------------
+
+        stage_stats = {}
+
+        if self.debug:
+
+            stage_stats[
+                "01_raw_linear"
+            ] = print_stats(
+                "01 RAW / LibRaw linear RGB",
+                linear_rgb,
             )
 
-            # ------------------------------------------------
-            # v18: LibRaw sRGB
-            # ------------------------------------------------
-
-            try:
-
-                rgb16 = raw_to_srgb(
-                    raw
-                )
-
-                conversion_method = (
-                    "LibRaw_sRGB_cameraWB"
-                )
-
-            except Exception as e:
-
-                print(
-                    "[WARN] Primary RAW "
-                    f"conversion failed: {e}"
-                )
-
-                rgb16 = raw_to_srgb_fallback(
-                    raw
-                )
-
-                conversion_method = (
-                    "LibRaw_sRGB_fallback"
-                )
-
         # ----------------------------------------------------
-        # RGB
+        # Analysis image
+        #
+        # IMPORTANT:
+        # gamma=(1,1) output is already treated
+        # as linear, so convert it to sRGB only
+        # for visual analysis / segmentation.
         # ----------------------------------------------------
 
-        srgb = srgb16_to_float(
-            rgb16
+        analysis_srgb = linear_to_srgb(
+            linear_rgb
         )
 
-        srgb = np.clip(
-            srgb,
-            0,
-            1,
-        )
+        if self.debug:
+
+            stage_stats[
+                "02_analysis_srgb"
+            ] = print_stats(
+                "02 Analysis sRGB",
+                analysis_srgb,
+            )
 
         # ----------------------------------------------------
-        # For analysis and development:
-        # sRGB -> linear
+        # Shooting
         # ----------------------------------------------------
-
-        linear_rgb = srgb_to_linear(
-            srgb
-        )
-
-        stats = analyze_image(
-            srgb
-        )
 
         shooting = analyze_shooting(
             metadata
+        )
+
+        print(
+            f"[INFO] ISO factor: "
+            f"{shooting.iso_factor:.3f}"
+        )
+
+        print(
+            f"[INFO] Estimated noise: "
+            f"{shooting.estimated_noise:.3f}"
         )
 
         # ----------------------------------------------------
@@ -2840,7 +2978,7 @@ class AutoDeveloper:
 
         labels, confidence = (
             self.segmenter.predict(
-                srgb
+                analysis_srgb
             )
         )
 
@@ -2849,304 +2987,252 @@ class AutoDeveloper:
         # ----------------------------------------------------
 
         saliency = compute_saliency(
-            srgb
+            analysis_srgb
         )
 
         # ----------------------------------------------------
-        # Subject ranking
+        # Subjects
         # ----------------------------------------------------
 
         subjects = rank_subjects(
-            srgb,
             labels,
             confidence,
             saliency,
+            analysis_srgb,
         )
 
-        # ----------------------------------------------------
-        # Regions
-        # ----------------------------------------------------
-
-        masks = make_region_masks(
-            srgb,
-            labels,
+        print(
+            "[INFO] Subjects:"
         )
 
-        region_stats = (
-            calculate_region_stats(
-                srgb,
-                masks,
+        for subject in subjects[:5]:
+
+            print(
+                f"  {subject.class_name}: "
+                f"score={subject.score:.3f}, "
+                f"area={subject.area:.3f}, "
+                f"confidence={subject.confidence:.3f}"
             )
-        )
 
         # ----------------------------------------------------
         # Scene
         # ----------------------------------------------------
 
-        scene_result = classify_scene(
-            stats,
+        analysis_stats = calculate_stats(
+            analysis_srgb
+        )
+
+        scene = classify_scene(
+            analysis_stats,
             shooting,
             subjects,
         )
 
         print(
             f"[INFO] Scene: "
-            f"{scene_result.scene} "
-            f"({scene_result.confidence:.2f})"
+            f"{scene.scene} "
+            f"(confidence={scene.confidence:.3f})"
         )
 
         # ----------------------------------------------------
-        # Base profile
+        # Base params
         # ----------------------------------------------------
 
-        base_params = (
-            SCENE_PROFILES[
-                scene_result.scene
-            ]
-        )
-
-        # ----------------------------------------------------
-        # Automatic exposure
-        # ----------------------------------------------------
-
-        auto_ev = estimate_exposure(
-            stats,
-            scene_result.scene,
-        )
-
-        base_params = DevelopParams(
-            exposure_ev=(
-                base_params.exposure_ev
-                +
-                auto_ev
-            ),
-
-            contrast=(
-                base_params.contrast
-            ),
-
-            saturation=(
-                base_params.saturation
-            ),
-
-            highlight_protection=(
-                base_params.highlight_protection
-            ),
-
-            shadow_lift=(
-                base_params.shadow_lift
-            ),
-
-            subject_exposure=(
-                base_params.subject_exposure
-            ),
-
-            subject_contrast=(
-                base_params.subject_contrast
-            ),
-
-            background_suppression=(
-                base_params.background_suppression
-            ),
-
-            denoise=(
-                base_params.denoise
-                *
-                (
-                    0.7
-                    +
-                    shooting.estimated_noise
-                    *
-                    0.6
-                )
-            ),
-
-            sharpen=(
-                base_params.sharpen
-                *
-                (
-                    1.0
-                    -
-                    shooting.estimated_noise
-                    *
-                    0.25
-                )
-            ),
-
-            region_skin_saturation=(
-                base_params.region_skin_saturation
-            ),
-
-            region_green_saturation=(
-                base_params.region_green_saturation
-            ),
-
-            region_water_highlight=(
-                base_params.region_water_highlight
-            ),
-
-            region_upper_highlight=(
-                base_params.region_upper_highlight
-            ),
-
-            tone_strength=(
-                base_params.tone_strength
-            ),
-        )
-
-        # ----------------------------------------------------
-        # Search
-        # ----------------------------------------------------
-
-        best_params, search_score = (
-            search_parameters(
-                linear_rgb,
-                base_params,
-                scene_result.scene,
+        params = DevelopParams(
+            **asdict(
+                SCENE_PROFILES[
+                    scene.scene
+                ]
             )
         )
 
+        exposure_ev = estimate_exposure(
+            analysis_stats,
+            scene.scene,
+        )
+
+        params.exposure_ev += (
+            exposure_ev
+        )
+
+        print(
+            f"[INFO] Estimated EV: "
+            f"{exposure_ev:+.3f}"
+        )
+
         # ----------------------------------------------------
-        # Final render
+        # Region masks
         # ----------------------------------------------------
 
-        rendered_linear = render_image(
-            linear_rgb,
+        masks = create_region_masks(
+            analysis_srgb,
+            labels,
+            subjects,
+        )
+
+        regions = calculate_region_stats(
+            analysis_srgb,
             masks,
-            best_params,
-        )
-
-        rendered_srgb = linear_to_srgb(
-            rendered_linear
-        )
-
-        rendered_srgb = np.clip(
-            rendered_srgb,
-            0,
-            1,
-        )
-
-        output_rgb = (
-            rendered_srgb * 255
-        ).astype(
-            np.uint8
-        )
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        Image.fromarray(
-            output_rgb,
-            mode="RGB",
-        ).save(
-            output_path,
-            quality=95,
-            subsampling=0,
         )
 
         # ----------------------------------------------------
-        # Debug
+        # Automatic parameter search
         # ----------------------------------------------------
 
-        if self.debug and debug_dir:
+        print(
+            "[INFO] Running parameter search..."
+        )
 
-            save_debug(
-                debug_dir,
-                input_path.stem,
-                labels,
-                saliency,
+        params, best_score, search_results = (
+            automatic_search(
+                linear_rgb,
+                params,
                 masks,
-            )
-
-        # ----------------------------------------------------
-        # Analysis report
-        # ----------------------------------------------------
-
-        report = {
-
-            "version": VERSION,
-
-            "input": str(
-                input_path
-            ),
-
-            "output": str(
-                output_path
-            ),
-
-            "conversion_method": (
-                conversion_method
-            ),
-
-            "camera": asdict(
-                camera
-            ),
-
-            "metadata": asdict(
-                metadata
-            ),
-
-            "stats": asdict(
-                stats
-            ),
-
-            "shooting": asdict(
-                shooting
-            ),
-
-            "scene": asdict(
-                scene_result
-            ),
-
-            "subjects": [
-                asdict(x)
-                for x in subjects
-            ],
-
-            "regions": [
-                asdict(x)
-                for x in region_stats
-            ],
-
-            "selected_parameters": asdict(
-                best_params
-            ),
-
-            "search_score": search_score,
-        }
-
-        json_path = (
-            output_path.with_suffix(
-                ".json"
+                scene.scene,
             )
         )
 
-        with open(
-            json_path,
-            "w",
-            encoding="utf-8",
-        ) as f:
+        print(
+            f"[INFO] Search score: "
+            f"{best_score:.6f}"
+        )
 
-            json.dump(
-                report,
-                f,
-                ensure_ascii=False,
-                indent=2,
+        print(
+            f"[INFO] Selected EV: "
+            f"{params.exposure_ev:+.3f}"
+        )
+
+        print(
+            f"[INFO] Selected contrast: "
+            f"{params.contrast:.3f}"
+        )
+
+        print(
+            f"[INFO] Selected saturation: "
+            f"{params.saturation:.3f}"
+        )
+
+        # ----------------------------------------------------
+        # Final development
+        # ----------------------------------------------------
+
+        stages = develop(
+            linear_rgb,
+            params,
+            masks,
+        )
+
+        # ----------------------------------------------------
+        # Debug stage statistics
+        # ----------------------------------------------------
+
+        if self.debug:
+
+            for key, image in stages.items():
+
+                srgb = linear_to_srgb(
+                    image
+                )
+
+                stage_stats[
+                    key
+                ] = print_stats(
+                    key,
+                    srgb,
+                )
+
+        # ----------------------------------------------------
+        # Final
+        # ----------------------------------------------------
+
+        final_linear = (
+            stages["final_linear"]
+        )
+
+        final_srgb = linear_to_srgb(
+            final_linear
+        )
+
+        if self.debug:
+
+            stage_stats[
+                "final_srgb"
+            ] = print_stats(
+                "FINAL JPEG sRGB",
+                final_srgb,
             )
+
+        # ----------------------------------------------------
+        # Save JPEG
+        # ----------------------------------------------------
+
+        ensure_dir(
+            output_path.parent
+        )
+
+        save_rgb(
+            output_path,
+            final_srgb,
+        )
 
         print(
             f"[INFO] Saved: "
             f"{output_path}"
         )
 
-        print(
-            f"[INFO] JSON: "
-            f"{json_path}"
-        )
+        # ----------------------------------------------------
+        # Debug
+        # ----------------------------------------------------
 
-        return report
+        if self.debug:
+
+            if debug_root is None:
+
+                debug_root = (
+                    output_path.parent /
+                    "debug"
+                )
+
+            debug_dir = (
+                debug_root /
+                input_path.stem
+            )
+
+            ensure_dir(
+                debug_dir
+            )
+
+            save_debug_images(
+                debug_dir,
+                linear_rgb,
+                stages,
+                labels,
+                confidence,
+                saliency,
+                masks,
+            )
+
+            save_debug_report(
+                debug_dir,
+                input_path,
+                output_path,
+                metadata,
+                profile,
+                raw_info,
+                shooting,
+                scene,
+                subjects,
+                regions,
+                stage_stats,
+                params,
+                best_score,
+                search_results,
+            )
+
+            print(
+                f"[DEBUG] Debug output: "
+                f"{debug_dir}"
+            )
 
 
 # ============================================================
@@ -3154,198 +3240,166 @@ class AutoDeveloper:
 # ============================================================
 
 def collect_raw_files(
-    input_path,
-):
-
-    input_path = Path(
-        input_path
-    )
-
-    if input_path.is_file():
-
-        if (
-            input_path.suffix.lower()
-            in RAW_EXTENSIONS
-        ):
-            return [input_path]
-
-        return []
+    root: Path,
+) -> List[Path]:
 
     files = []
 
-    for path in input_path.rglob("*"):
+    for path in root.rglob("*"):
 
         if (
-            path.is_file()
-            and
+            path.is_file() and
             path.suffix.lower()
             in RAW_EXTENSIONS
         ):
             files.append(path)
 
-    return sorted(files)
+    return sorted(
+        files
+    )
 
 
 # ============================================================
-# CLI
+# Main
 # ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Automatic RAW Developer v18"
+            "Automatic RAW developer v19"
         )
     )
 
     parser.add_argument(
         "input",
+        type=Path,
         help="RAW file or directory",
     )
 
     parser.add_argument(
         "-o",
         "--output",
-        default="output",
+        type=Path,
+        default=Path("output"),
         help="Output directory",
     )
 
     parser.add_argument(
         "--device",
-        default="auto",
         choices=[
             "auto",
             "cpu",
             "cuda",
         ],
-        help="Inference device",
+        default="auto",
+        help="Segmentation device",
     )
 
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Save segmentation/saliency/region masks",
+        help=(
+            "Enable detailed statistics, "
+            "intermediate images and JSON"
+        ),
     )
 
     args = parser.parse_args()
 
-    input_path = Path(
-        args.input
-    )
+    input_path = args.input
 
-    output_dir = Path(
-        args.output
-    )
+    if input_path.is_file():
 
-    files = collect_raw_files(
-        input_path
-    )
+        raw_files = [
+            input_path
+        ]
 
-    if not files:
+    elif input_path.is_dir():
+
+        raw_files = collect_raw_files(
+            input_path
+        )
+
+    else:
+
+        raise FileNotFoundError(
+            input_path
+        )
+
+    if not raw_files:
 
         print(
             "[ERROR] No RAW files found."
         )
 
-        return 1
+        return
 
     print(
-        f"[INFO] RAW files: "
-        f"{len(files)}"
+        f"[INFO] Found "
+        f"{len(raw_files)} RAW files."
     )
+
+    if args.debug:
+
+        print(
+            "[INFO] DEBUG MODE ENABLED"
+        )
 
     developer = AutoDeveloper(
         device=args.device,
         debug=args.debug,
     )
 
-    success = 0
-    failed = 0
-
-    for raw_path in files:
+    for raw_file in raw_files:
 
         try:
 
             if input_path.is_file():
 
                 relative = (
-                    raw_path.name
+                    raw_file.stem +
+                    ".jpg"
                 )
 
             else:
 
-                try:
-                    relative = (
-                        raw_path.relative_to(
-                            input_path
-                        )
+                relative = (
+                    raw_file.relative_to(
+                        input_path
+                    ).with_suffix(
+                        ".jpg"
                     )
-                except ValueError:
-                    relative = raw_path.name
+                )
 
-            relative = Path(
+            output_file = (
+                args.output /
                 relative
             )
 
-            output_path = (
-                output_dir
-                /
-                relative.with_suffix(
-                    ".jpg"
-                )
-            )
-
-            debug_dir = (
-                output_dir
-                /
+            debug_root = (
+                args.output /
                 "debug"
             )
 
-            developer.process_file(
-                raw_path,
-                output_path,
-                debug_dir,
+            developer.process(
+                raw_file,
+                output_file,
+                debug_root=debug_root,
             )
-
-            success += 1
 
         except Exception as e:
 
-            failed += 1
-
             print(
                 f"[ERROR] Failed: "
-                f"{raw_path}"
+                f"{raw_file}"
             )
 
             print(
-                f"        {type(e).__name__}: "
-                f"{e}"
+                f"        "
+                f"{type(e).__name__}: {e}"
             )
-
-    print()
-    print(
-        "[INFO] Finished"
-    )
-
-    print(
-        f"[INFO] Success: "
-        f"{success}"
-    )
-
-    print(
-        f"[INFO] Failed: "
-        f"{failed}"
-    )
-
-    return (
-        0
-        if failed == 0
-        else 1
-    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        main()
-    )
+    main()
