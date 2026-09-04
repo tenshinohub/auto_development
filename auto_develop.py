@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v23
+Automatic RAW Developer v24
 
 Pipeline
 --------
@@ -1272,20 +1272,32 @@ def make_region_masks(
         )
     )
 
-    subject = (
+    # Semantic subject mask. This is deliberately kept separate from
+    # the fallback candidate mask so that the debug output can distinguish
+    # a true semantic subject from a heuristic fallback.
+    semantic_subject = (
         person
         | animal
         | vehicle
         | plant
     )
 
-    # If semantic segmentation found no useful subject,
-    # use the strongest candidate.
-    if not np.any(subject) and subjects:
-        subject = (
+    candidate_subject = np.zeros_like(
+        semantic_subject,
+        dtype=bool,
+    )
+
+    if not np.any(semantic_subject) and subjects:
+        candidate_subject = (
             class_map
             == subjects[0].class_id
         )
+
+    # Effective subject used for local development.
+    subject = (
+        semantic_subject
+        | candidate_subject
+    )
 
     rgb8 = np.clip(
         image * 255,
@@ -1376,6 +1388,8 @@ def make_region_masks(
     masks["animal"] = animal
     masks["vehicle"] = vehicle
     masks["plant"] = plant
+    masks["semantic_subject"] = semantic_subject
+    masks["candidate_subject"] = candidate_subject
     masks["skin"] = skin
     masks["green"] = green
     masks["blue"] = blue
@@ -1902,39 +1916,28 @@ def apply_region_processing(
     background = masks["background"]
 
     # --------------------------------------------------------
-    # Subject
+    # Subject luminance / contrast
     # --------------------------------------------------------
-
+    # Change luminance only. Multiplying RGB channels independently is
+    # avoided so that local exposure/contrast cannot introduce a hue shift.
     if np.any(subject):
-        subject_img = out[subject]
+        pix = out[subject]
+        y = luminance(pix)
 
-        subject_y = luminance(
-            subject_img
-        )
-
-        subject_y2 = (
-            (subject_y - 0.18)
+        y2 = (
+            (y - 0.18)
             * params.subject_contrast
             + 0.18
         )
 
-        subject_ratio = (
-            subject_y2
-            / (subject_y + 1e-6)
-        )
+        y2 *= 2.0 ** params.subject_exposure
+        y2 = np.clip(y2, 0, 1)
 
-        subject_img = (
-            subject_img
-            * subject_ratio[:, None]
-        )
-
-        subject_img *= (
-            2.0
-            ** params.subject_exposure
-        )
+        ratio = y2 / np.maximum(y, 1e-6)
+        pix = pix * ratio[:, None]
 
         out[subject] = np.clip(
-            subject_img,
+            pix,
             0,
             1,
         )
@@ -1942,96 +1945,64 @@ def apply_region_processing(
     # --------------------------------------------------------
     # Background suppression
     # --------------------------------------------------------
-
+    # Again, only luminance is changed.
     if np.any(background):
-        bg = out[background]
+        pix = out[background]
+        y = luminance(pix)
 
-        bg_y = luminance(bg)
-
-        suppression = (
+        y2 = y * (
             1.0
             - params.background_suppression
         )
+        y2 = np.clip(y2, 0, 1)
 
-        bg_y2 = (
-            bg_y
-            * suppression
-        )
-
-        ratio = (
-            bg_y2
-            / (bg_y + 1e-6)
-        )
-
-        bg = bg * ratio[:, None]
+        ratio = y2 / np.maximum(y, 1e-6)
+        pix = pix * ratio[:, None]
 
         out[background] = np.clip(
-            bg,
+            pix,
             0,
             1,
         )
 
     # --------------------------------------------------------
-    # Skin saturation
+    # Saturation regions
     # --------------------------------------------------------
+    # Combine all saturation adjustments into one operation per pixel.
+    # The old sequential skin -> green -> water processing could modify
+    # the same pixel multiple times. Here the masks have an explicit
+    # priority, so there is no cumulative chroma drift.
+    saturation_factor = np.ones(
+        out.shape[:2],
+        dtype=np.float32,
+    )
 
     skin = masks["skin"]
-
-    if np.any(skin):
-        pix = out[skin]
-        y = luminance(pix)
-
-        pix = (
-            y[:, None]
-            + (pix - y[:, None])
-            * params.skin_saturation
-        )
-
-        out[skin] = np.clip(
-            pix,
-            0,
-            1,
-        )
-
-    # --------------------------------------------------------
-    # Green saturation
-    # --------------------------------------------------------
-
     green = masks["green"]
-
-    if np.any(green):
-        pix = out[green]
-        y = luminance(pix)
-
-        pix = (
-            y[:, None]
-            + (pix - y[:, None])
-            * params.green_saturation
-        )
-
-        out[green] = np.clip(
-            pix,
-            0,
-            1,
-        )
-
-    # --------------------------------------------------------
-    # Water
-    # --------------------------------------------------------
-
     water = masks["water"]
 
-    if np.any(water):
-        pix = out[water]
+    # Skin has the highest priority, then water, then green.
+    saturation_factor[green] = params.green_saturation
+    saturation_factor[water] = params.water_saturation
+    saturation_factor[skin] = params.skin_saturation
+
+    active = (
+        saturation_factor
+        != 1.0
+    )
+
+    if np.any(active):
+        pix = out[active]
         y = luminance(pix)
+        factor = saturation_factor[active]
 
         pix = (
             y[:, None]
             + (pix - y[:, None])
-            * params.water_saturation
+            * factor[:, None]
         )
 
-        out[water] = np.clip(
+        out[active] = np.clip(
             pix,
             0,
             1,
@@ -2040,12 +2011,11 @@ def apply_region_processing(
     # --------------------------------------------------------
     # Upper bright area
     # --------------------------------------------------------
-
+    # Brightness only; chroma ratios are preserved.
     upper = masks["upper_bright"]
 
     if np.any(upper):
         pix = out[upper]
-
         y = luminance(pix)
 
         lift = (
@@ -2058,7 +2028,14 @@ def apply_region_processing(
             )
         )
 
-        pix *= lift[:, None]
+        y2 = np.clip(
+            y * lift,
+            0,
+            1,
+        )
+
+        ratio = y2 / np.maximum(y, 1e-6)
+        pix = pix * ratio[:, None]
 
         out[upper] = np.clip(
             pix,
@@ -2258,6 +2235,35 @@ def apply_sharpen(
 # ============================================================
 # Region statistics
 # ============================================================
+
+def print_region_color_drift(
+    before: np.ndarray,
+    after: np.ndarray,
+) -> None:
+    """Print global color/chroma changes caused by local processing."""
+
+    b = calculate_stats(before)
+    a = calculate_stats(after)
+
+    print()
+    print("Region color drift:")
+    print(
+        f"  R/G               : "
+        f"{b.rg_ratio:.4f} -> {a.rg_ratio:.4f} "
+        f"(delta {a.rg_ratio - b.rg_ratio:+.4f})"
+    )
+    print(
+        f"  G/B               : "
+        f"{b.gb_ratio:.4f} -> {a.gb_ratio:.4f} "
+        f"(delta {a.gb_ratio - b.gb_ratio:+.4f})"
+    )
+    print(
+        f"  saturation        : "
+        f"{b.saturation_ratio * 100:.3f}% -> "
+        f"{a.saturation_ratio * 100:.3f}% "
+        f"(delta {(a.saturation_ratio - b.saturation_ratio) * 100:+.3f}pp)"
+    )
+
 
 def calculate_region_stats(
     image: np.ndarray,
@@ -2756,7 +2762,22 @@ class AutoDeveloper:
         # Subjects
         # ----------------------------------------------------
 
+        semantic_subject_area = float(
+            np.mean(masks["semantic_subject"])
+        )
+        candidate_subject_area = float(
+            np.mean(masks["candidate_subject"])
+        )
+
         print()
+        print(
+            f"Semantic subject area : "
+            f"{semantic_subject_area:.3f}"
+        )
+        print(
+            f"Fallback subject area : "
+            f"{candidate_subject_area:.3f}"
+        )
 
         if subjects:
             for subject in subjects[:5]:
@@ -3005,10 +3026,17 @@ class AutoDeveloper:
         # Stage 07: local region
         # ----------------------------------------------------
 
+        region_before_image = current.copy()
+
         current = apply_region_processing(
             current,
             masks,
             params,
+        )
+
+        print_region_color_drift(
+            region_before_image,
+            current,
         )
 
         region_after = (
