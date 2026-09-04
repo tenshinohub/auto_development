@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v22.1
+Automatic RAW Developer v23
 
 Pipeline
 --------
@@ -49,7 +49,7 @@ torchvision
 
 Example
 -------
-python3 auto_develop_v22_1.py photos -o developed --device cuda --debug
+python3 auto_develop_v23.py photos -o developed --device cuda --debug
 """
 
 from __future__ import annotations
@@ -192,7 +192,7 @@ class ImageStats:
     rg_ratio: float
     gb_ratio: float
 
-    # v22.1
+    # v23
     warm_ratio: float
 
 
@@ -1662,6 +1662,14 @@ def estimate_exposure_ev(
     stats: ImageStats,
     target: float,
 ) -> float:
+    """Estimate exposure while making better use of highlight headroom.
+
+    v23 changes:
+    - The previous model was too conservative for normally exposed images
+      whose p99 was far below the highlight limits.
+    - Headroom bonus is now progressive up to p99 < 0.60.
+    - The result is still constrained by the actual highlight levels.
+    """
 
     median_error = (
         target - stats.median
@@ -1694,10 +1702,15 @@ def estimate_exposure_ev(
         + hard_penalty
     )
 
-    if stats.p99 < 0.45:
-        ev += 0.10
-    elif stats.p99 < 0.55:
-        ev += 0.05
+    # Use available highlight headroom more aggressively.
+    if stats.p99 < 0.40:
+        ev += 0.25
+    elif stats.p99 < 0.45:
+        ev += 0.20
+    elif stats.p99 < 0.50:
+        ev += 0.15
+    elif stats.p99 < 0.60:
+        ev += 0.08
 
     if median_error > 0.03:
         ev += 0.05
@@ -1783,39 +1796,52 @@ def apply_tone(
     shadow_lift: float,
     highlight_protection: float,
 ) -> np.ndarray:
+    """Apply a gentle, mostly brightness-neutral tone adjustment.
 
-    image = normalize_image(image)
+    The old S-curve lowered pixels around the normal midtone range because
+    tanh((y - 0.45) * 3) is negative for most ordinary photographs.
+    v23 anchors the curve around 0.18 and uses separate shadow/highlight
+    controls, so tone no longer makes an otherwise correctly exposed image
+    globally darker.
+    """
 
-    y = luminance(image)
+    image = normalize_image(
+        image
+    )
 
-    # --------------------------------------------------------
-    # Gentle S curve
-    # --------------------------------------------------------
+    y = luminance(
+        image
+    )
+
+    # Very gentle midtone shaping, anchored at 18% luminance.
+    # The anchor subtraction keeps 0.18 approximately unchanged.
+    anchor = math.tanh(
+        (0.18 - 0.45) * 3.0
+    )
+
+    curve = (
+        np.tanh(
+            (y - 0.45) * 3.0
+        )
+        - anchor
+    )
 
     s = (
         y
         + strength
-        * 0.12
-        * np.tanh(
-            (y - 0.45) * 3.0
-        )
+        * 0.055
+        * curve
     )
 
-    # --------------------------------------------------------
-    # Shadows
-    #
-    # Only affect dark pixels.
-    # Do not globally lift the image.
-    # --------------------------------------------------------
-
+    # Shadows: lift only the dark range.
     shadow_mask = np.clip(
-        (0.18 - y) / 0.18,
+        (0.22 - y) / 0.22,
         0,
         1,
     )
 
     shadow_mask *= np.clip(
-        y / 0.18,
+        y / 0.22,
         0,
         1,
     )
@@ -1825,25 +1851,17 @@ def apply_tone(
         * shadow_mask
     )
 
-    # --------------------------------------------------------
-    # Highlights
-    # --------------------------------------------------------
-
+    # Highlights: compress only where needed.
     highlight_mask = np.clip(
-        (y - 0.70) / 0.30,
+        (y - 0.68) / 0.32,
         0,
         1,
     )
 
     s -= (
         highlight_protection
-        * 0.08
+        * 0.055
         * highlight_mask
-        * np.clip(
-            (y - 0.70) / 0.30,
-            0,
-            1,
-        )
     )
 
     s = np.clip(
@@ -1852,15 +1870,14 @@ def apply_tone(
         1,
     )
 
-    # --------------------------------------------------------
-    # Apply luminance change while preserving chroma.
-    # --------------------------------------------------------
-
     ratio = s / (
         y + 1e-6
     )
 
-    out = image * ratio[..., None]
+    out = (
+        image
+        * ratio[..., None]
+    )
 
     return np.clip(
         out,
@@ -2291,20 +2308,27 @@ def score_candidate(
     target: float,
     subject_mask: Optional[np.ndarray],
 ) -> float:
-
     stats = calculate_stats(
         image
     )
 
     score = 0.0
 
-    # Global exposure
+    # Global exposure.
     score -= abs(
         stats.median
         - target
     ) * 5.0
 
-    # Highlight protection
+    # Prefer a useful overall brightness when the image has
+    # substantial highlight headroom.
+    if stats.p99 < 0.50:
+        score += min(
+            0.08,
+            (0.50 - stats.p99) * 0.20,
+        )
+
+    # Highlight protection.
     if stats.p95 > 0.68:
         score -= (
             stats.p95 - 0.68
@@ -2315,27 +2339,27 @@ def score_candidate(
             stats.p99 - 0.82
         ) * 7.0
 
-    # Avoid crushed shadows
+    # Avoid crushed shadows.
     if stats.shadow_ratio > 0.12:
         score -= (
             stats.shadow_ratio
             - 0.12
         ) * 2.0
 
-    # Reasonable contrast
+    # Reasonable contrast.
     score -= abs(
         stats.contrast
         - 0.10
     ) * 0.5
 
-    # Saturation
+    # Saturation.
     if stats.saturation_ratio > 0.75:
         score -= (
             stats.saturation_ratio
             - 0.75
         )
 
-    # Subject
+    # Subject.
     if (
         subject_mask is not None
         and np.any(subject_mask)
@@ -2361,10 +2385,6 @@ def score_candidate(
             subject_median
             - subject_target
         ) * 2.0
-
-        # Small reward for usable highlight headroom.
-        if stats.p99 < 0.75:
-            score += 0.03
 
     return float(score)
 
@@ -2435,8 +2455,18 @@ def automatic_parameter_search(
                     saturation,
                 )
 
-                score = score_candidate(
+                # Score the candidate after the tone stage as well.
+                # This prevents the search from selecting an EV that looks
+                # correct before tone but becomes dark afterward.
+                candidate_tone = apply_tone(
                     candidate,
+                    profile["tone"],
+                    profile["shadow"],
+                    profile["highlight"],
+                )
+
+                score = score_candidate(
+                    candidate_tone,
                     scene,
                     target,
                     subject_mask,
@@ -3044,6 +3074,63 @@ class AutoDeveloper:
             params.sharpen,
         )
 
+        # ----------------------------------------------------
+        # Final brightness feedback
+        # ----------------------------------------------------
+        # Tone/local processing can change the global median.  Apply only
+        # a small corrective EV so the final image does not remain dark.
+        final_stats_before_feedback = calculate_stats(
+            current
+        )
+
+        final_target = calculate_exposure_target(
+            scene
+        )
+
+        final_error = (
+            final_target
+            - final_stats_before_feedback.median
+        )
+
+        if final_error > 0.015:
+            correction_ev = clamp(
+                math.log2(
+                    max(final_target, 1e-5)
+                    / max(
+                        final_stats_before_feedback.median,
+                        1e-5,
+                    )
+                ) * 0.55,
+                0.0,
+                0.30,
+            )
+
+            # Never use the feedback to push an already bright/highlighted
+            # image upward.
+            if (
+                final_stats_before_feedback.p99 < 0.65
+                and correction_ev > 0.0
+            ):
+                current = apply_exposure(
+                    current,
+                    correction_ev,
+                )
+
+                print(
+                    f"Final brightness correction: "
+                    f"{correction_ev:+.3f} EV"
+                )
+            else:
+                print(
+                    "Final brightness correction: "
+                    "skipped (highlight headroom)"
+                )
+        else:
+            print(
+                "Final brightness correction: "
+                "not needed"
+            )
+
         if self.debug:
             save_stage(
                 self.debug_dir,
@@ -3198,7 +3285,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Automatic RAW developer v22.1"
+            "Automatic RAW developer v23"
         )
     )
 
