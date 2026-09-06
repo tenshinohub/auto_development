@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v26
+Automatic RAW Developer v27
 
 Pipeline
 --------
@@ -1324,6 +1324,110 @@ def make_region_masks(
         & (v_channel > 50)
     )
 
+    # --------------------------------------------------------
+    # v27: heuristic face candidate
+    # --------------------------------------------------------
+    # DeepLabV3 gives us a person mask, but not a face class.  Build a
+    # conservative face candidate from skin-like pixels located in the
+    # upper part of each connected person component.  This is deliberately
+    # heuristic and is only used when confidence is sufficiently high.
+    #
+    # Keep this separate from `skin`: hands/arms can also be skin-like,
+    # while the face correction should be restricted to the upper body.
+    face_mask = np.zeros_like(person, dtype=bool)
+    face_confidence = 0.0
+
+    relaxed_skin = (
+        person
+        & (
+            (h_channel < 28)
+            | (h_channel > 165)
+        )
+        & (s_channel >= 20)
+        & (v_channel >= 35)
+    )
+
+    person_u8 = person.astype(np.uint8)
+    n_person, person_labels, person_stats, person_centroids = cv2.connectedComponentsWithStats(
+        person_u8,
+        connectivity=8,
+    )
+
+    face_scores = []
+
+    for person_id in range(1, n_person):
+        px, py, pw, ph, parea = person_stats[person_id]
+        if parea < 100:
+            continue
+
+        component = person_labels == person_id
+        upper_limit = py + int(ph * 0.55)
+
+        candidate = relaxed_skin & component
+        candidate &= np.indices(person.shape)[0] <= upper_limit
+
+        n_candidate, candidate_labels, candidate_stats, candidate_centroids = cv2.connectedComponentsWithStats(
+            candidate.astype(np.uint8),
+            connectivity=8,
+        )
+
+        best_candidate = None
+        best_score = 0.0
+
+        for cid in range(1, n_candidate):
+            area = int(candidate_stats[cid, cv2.CC_STAT_AREA])
+            if area < 30 or area > max(int(parea * 0.20), 30):
+                continue
+
+            cx, cy = candidate_centroids[cid]
+            rel_y = (cy - py) / max(ph, 1)
+            rel_x = abs((cx - (px + pw * 0.5)) / max(pw, 1))
+
+            # Prefer pixels around the upper 0-40% of the person and
+            # reasonably close to the person's horizontal center.
+            position_score = clamp(
+                1.0 - abs(rel_y - 0.25) / 0.30,
+                0.0,
+                1.0,
+            )
+            center_score = clamp(
+                1.0 - rel_x / 0.65,
+                0.0,
+                1.0,
+            )
+
+            component_mask = candidate_labels == cid
+            skin_strength = float(
+                np.mean(
+                    np.clip((s_channel[component_mask] - 20) / 80.0, 0.0, 1.0)
+                    * np.clip((v_channel[component_mask] - 35) / 100.0, 0.0, 1.0)
+                )
+            )
+
+            area_score = clamp(
+                math.sqrt(area / max(parea * 0.02, 1.0)),
+                0.0,
+                1.0,
+            )
+
+            score = (
+                position_score * 0.40
+                + center_score * 0.20
+                + skin_strength * 0.25
+                + area_score * 0.15
+            )
+
+            if score > best_score:
+                best_score = score
+                best_candidate = component_mask
+
+        if best_candidate is not None and best_score >= 0.48:
+            face_mask |= best_candidate
+            face_scores.append(best_score)
+
+    if face_scores:
+        face_confidence = float(np.mean(face_scores))
+
     green = (
         (h_channel >= 30)
         & (h_channel <= 95)
@@ -1391,6 +1495,8 @@ def make_region_masks(
     masks["semantic_subject"] = semantic_subject
     masks["candidate_subject"] = candidate_subject
     masks["skin"] = skin
+    masks["face"] = face_mask
+    masks["face_confidence"] = np.array(face_confidence, dtype=np.float32)
     masks["green"] = green
     masks["blue"] = blue
     masks["water"] = water
@@ -2048,6 +2154,52 @@ def apply_region_processing(
             f"{shadow_median_after:.3f}"
             if shadow_median_before is not None
             else "Subject shadow lift: no subject pixels below 0.20"
+        )
+
+    # --------------------------------------------------------
+    # v27: face shadow lift
+    # --------------------------------------------------------
+    # The person-level correction above deliberately targets the whole
+    # subject.  v27 adds a second, much weaker correction for a confident
+    # face candidate so that facial/helmet-adjacent shadows can be opened
+    # without lifting bright uniforms.
+    face = masks.get("face")
+    face_confidence = float(masks.get("face_confidence", 0.0))
+
+    if face is not None and np.any(face) and face_confidence >= 0.48:
+        pix = out[face]
+        y = luminance(pix)
+        face_median_before = float(np.median(y))
+
+        # Strongest below 0.18, fading to zero by 0.36.
+        weight = np.clip(
+            (0.36 - y) / 0.18,
+            0.0,
+            1.0,
+        )
+
+        # Confidence limits the maximum lift.  At confidence 1 the
+        # maximum multiplicative gain is about +0.12 EV equivalent.
+        max_gain = 1.0 + 0.12 * clamp(face_confidence, 0.0, 1.0)
+        gain = 1.0 + (max_gain - 1.0) * weight
+
+        y2 = np.clip(y * gain, 0, 1)
+        ratio = y2 / np.maximum(y, 1e-6)
+        pix = pix * ratio[:, None]
+        out[face] = np.clip(pix, 0, 1)
+
+        face_median_after = float(np.median(y2))
+
+        print(
+            f"Face shadow lift: confidence {face_confidence:.3f}, "
+            f"area {float(np.mean(face)):.4f}, "
+            f"median {face_median_before:.3f} -> "
+            f"{face_median_after:.3f}"
+        )
+    else:
+        print(
+            f"Face shadow lift: skipped "
+            f"(confidence {face_confidence:.3f})"
         )
 
     # --------------------------------------------------------
@@ -2885,6 +3037,12 @@ class AutoDeveloper:
         print(
             f"Fallback subject area : "
             f"{candidate_subject_area:.3f}"
+        )
+
+        print(
+            f"Face candidate area   : "
+            f"{float(np.mean(masks['face'])):.4f} "
+            f"confidence {float(masks.get('face_confidence', 0.0)):.3f}"
         )
 
         if subjects:
