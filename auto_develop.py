@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v24
+Automatic RAW Developer v26
 
 Pipeline
 --------
@@ -1970,7 +1970,47 @@ def apply_region_processing(
         y2 *= 2.0 ** effective_subject_ev
         y2 = np.clip(y2, 0, 1)
 
-        ratio = y2 / np.maximum(y, 1e-6)
+        # ----------------------------------------------------
+        # v26: subject-internal shadow lift
+        # ----------------------------------------------------
+        # A whole-subject exposure correction is not enough when a person
+        # contains both bright areas (for example a white uniform) and
+        # dark areas (face, helmet, blue jersey, etc.).  In that case the
+        # subject median can already be acceptable while the important
+        # dark detail remains buried.
+        #
+        # Lift only the lower luminance range and smoothly reduce the
+        # correction toward the midtones.  This keeps bright clothing and
+        # reflective objects largely unchanged.  The operation is
+        # luminance-only, so RGB ratios are preserved.
+        dark_weight = np.clip(
+            (0.34 - y2) / 0.34,
+            0.0,
+            1.0,
+        )
+
+        # Additional protection above the midtones.
+        dark_weight *= np.clip(
+            (0.45 - y2) / 0.25,
+            0.0,
+            1.0,
+        )
+
+        shadow_gain = (
+            1.0
+            + 0.16 * dark_weight
+        )
+
+        y3 = np.clip(
+            y2 * shadow_gain,
+            0,
+            1,
+        )
+
+        shadow_pixels_before = y2 < 0.20
+        shadow_pixels_after = y3 < 0.20
+
+        ratio = y3 / np.maximum(y, 1e-6)
         pix = pix * ratio[:, None]
 
         out[subject] = np.clip(
@@ -1979,12 +2019,35 @@ def apply_region_processing(
             1,
         )
 
+        shadow_median_before = (
+            float(np.median(y2[shadow_pixels_before]))
+            if np.any(shadow_pixels_before)
+            else None
+        )
+        shadow_median_after = (
+            float(np.median(y3[shadow_pixels_before]))
+            if np.any(shadow_pixels_before)
+            else None
+        )
+
         print(
             f"Adaptive subject exposure: "
             f"base {params.subject_exposure:+.3f} EV, "
             f"adaptive {adaptive_ev:+.3f} EV, "
             f"subject median {subject_median:.3f} -> "
             f"target {min(subject_target, 0.25):.3f}"
+        )
+
+        print(
+            f"Subject shadow lift: "
+            f"median<0.20 pixels "
+            f"{int(np.count_nonzero(shadow_pixels_before))} -> "
+            f"{int(np.count_nonzero(shadow_pixels_after))}, "
+            f"median "
+            f"{shadow_median_before:.3f} -> "
+            f"{shadow_median_after:.3f}"
+            if shadow_median_before is not None
+            else "Subject shadow lift: no subject pixels below 0.20"
         )
 
     # --------------------------------------------------------
