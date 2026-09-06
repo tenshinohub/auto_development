@@ -1920,6 +1920,11 @@ def apply_region_processing(
     # --------------------------------------------------------
     # Change luminance only. Multiplying RGB channels independently is
     # avoided so that local exposure/contrast cannot introduce a hue shift.
+    #
+    # v25: add adaptive subject exposure. A fixed +0.08 EV is too weak for
+    # scenes where the detected subject is substantially darker than the
+    # intended subject target. The correction is deliberately capped and
+    # reduced when the subject already contains bright pixels.
     if np.any(subject):
         pix = out[subject]
         y = luminance(pix)
@@ -1930,7 +1935,39 @@ def apply_region_processing(
             + 0.18
         )
 
-        y2 *= 2.0 ** params.subject_exposure
+        subject_median = float(np.median(y))
+        subject_p95 = float(np.percentile(y, 95))
+
+        if subject_median > 1e-5:
+            if subject_median < 0.25:
+                subject_target = 0.25
+            else:
+                subject_target = subject_median
+
+            adaptive_ev = clamp(
+                math.log2(
+                    subject_target
+                    / max(subject_median, 1e-5)
+                ) * 0.70,
+                0.0,
+                0.25,
+            )
+
+            # Protect bright uniforms / reflective objects.
+            if subject_p95 > 0.70:
+                adaptive_ev *= 0.25
+            elif subject_p95 > 0.60:
+                adaptive_ev *= 0.50
+
+            effective_subject_ev = (
+                params.subject_exposure
+                + adaptive_ev
+            )
+        else:
+            adaptive_ev = 0.0
+            effective_subject_ev = params.subject_exposure
+
+        y2 *= 2.0 ** effective_subject_ev
         y2 = np.clip(y2, 0, 1)
 
         ratio = y2 / np.maximum(y, 1e-6)
@@ -1940,6 +1977,14 @@ def apply_region_processing(
             pix,
             0,
             1,
+        )
+
+        print(
+            f"Adaptive subject exposure: "
+            f"base {params.subject_exposure:+.3f} EV, "
+            f"adaptive {adaptive_ev:+.3f} EV, "
+            f"subject median {subject_median:.3f} -> "
+            f"target {min(subject_target, 0.25):.3f}"
         )
 
     # --------------------------------------------------------
