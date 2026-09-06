@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v27
+Automatic RAW Developer v28
 
 Pipeline
 --------
@@ -282,6 +282,81 @@ def ensure_float32(image: np.ndarray) -> np.ndarray:
 
 def normalize_image(image: np.ndarray) -> np.ndarray:
     return np.clip(image.astype(np.float32), 0.0, 1.0)
+
+
+def soften_mask(
+    mask: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    """Convert a hard mask to a soft [0, 1] weight with Gaussian falloff.
+
+    A hard boolean subject/background split leaves a visible seam where
+    DeepLab cuts through dirt, grass, or clothing. Blurring the mask
+    makes local exposure and saturation changes fade out instead of
+    stepping.
+    """
+
+    weight = np.asarray(mask, dtype=np.float32)
+
+    if weight.ndim > 2:
+        weight = np.squeeze(weight)
+
+    weight = np.clip(weight, 0.0, 1.0)
+
+    if radius < 0.5 or weight.size == 0:
+        return weight
+
+    # Keep a small core of the original mask so the subject still
+    # receives the full correction after the blur dilutes the edge.
+    eroded = cv2.erode(
+        weight,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3),
+        ),
+        iterations=1,
+    )
+
+    blurred = cv2.GaussianBlur(
+        weight,
+        (0, 0),
+        sigmaX=float(radius),
+        sigmaY=float(radius),
+    )
+
+    soft = np.maximum(eroded * 0.35 + blurred * 0.65, blurred)
+
+    return np.clip(soft, 0.0, 1.0)
+
+
+def mask_feather_radius(shape: tuple[int, ...]) -> float:
+    """Scale the seam-hiding blur with image size."""
+
+    h = int(shape[0])
+    w = int(shape[1]) if len(shape) > 1 else h
+    return float(clamp(min(h, w) * 0.018, 12.0, 48.0))
+
+
+def erode_bool_mask(
+    mask: np.ndarray,
+    pixels: int,
+) -> np.ndarray:
+    """Pull a hard mask inward so edge dirt is not treated as subject."""
+
+    if pixels <= 0:
+        return mask.astype(bool)
+
+    k = 2 * int(pixels) + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (k, k),
+    )
+
+    return cv2.erode(
+        mask.astype(np.uint8),
+        kernel,
+        iterations=1,
+    ).astype(bool)
 
 
 # ============================================================
@@ -1314,14 +1389,26 @@ def make_region_masks(
     s_channel = hsv[..., 1]
     v_channel = hsv[..., 2]
 
+    # Erode the person mask before building skin. Infield dirt is
+    # orange-brown and sits in the same HSV range as skin; DeepLab
+    # also tends to leak a few pixels onto the clay around feet and
+    # elbows. Those leaked pixels used to form the visible halo.
+    person_core = cv2.erode(
+        person.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    ).astype(bool)
+
     skin = (
-        person
+        person_core
         & (
             (h_channel < 25)
             | (h_channel > 170)
         )
         & (s_channel > 35)
+        & (s_channel < 170)
         & (v_channel > 50)
+        & (v_channel < 230)
     )
 
     # --------------------------------------------------------
@@ -1623,17 +1710,17 @@ SCENE_PROFILES = {
     "portrait": dict(
         exposure=0.00,
         contrast=1.02,
-        saturation=0.99,
+        saturation=1.05,
         highlight=0.35,
         shadow=0.025,
         subject=0.08,
         subject_contrast=1.02,
-        background=0.015,
+        background=0.008,
         denoise=0.28,
         sharpen=0.75,
-        skin=0.97,
-        green=1.00,
-        water=0.06,
+        skin=1.02,
+        green=1.03,
+        water=1.06,
         upper=0.10,
         tone=0.30,
     ),
@@ -1641,17 +1728,17 @@ SCENE_PROFILES = {
     "night": dict(
         exposure=0.00,
         contrast=1.04,
-        saturation=1.02,
+        saturation=1.07,
         highlight=0.45,
         shadow=0.015,
         subject=0.05,
         subject_contrast=1.02,
-        background=0.010,
+        background=0.006,
         denoise=0.30,
         sharpen=0.45,
-        skin=0.97,
-        green=1.00,
-        water=0.08,
+        skin=1.02,
+        green=1.03,
+        water=1.06,
         upper=0.14,
         tone=0.30,
     ),
@@ -1659,17 +1746,17 @@ SCENE_PROFILES = {
     "sunset": dict(
         exposure=-0.02,
         contrast=1.05,
-        saturation=1.04,
+        saturation=1.10,
         highlight=0.45,
         shadow=0.025,
         subject=0.05,
         subject_contrast=1.02,
-        background=0.010,
+        background=0.006,
         denoise=0.20,
         sharpen=0.75,
-        skin=0.98,
-        green=1.01,
-        water=0.08,
+        skin=1.03,
+        green=1.04,
+        water=1.08,
         upper=0.16,
         tone=0.35,
     ),
@@ -1677,17 +1764,17 @@ SCENE_PROFILES = {
     "landscape": dict(
         exposure=0.02,
         contrast=1.06,
-        saturation=1.03,
+        saturation=1.09,
         highlight=0.35,
         shadow=0.035,
         subject=0.05,
         subject_contrast=1.02,
-        background=0.010,
+        background=0.006,
         denoise=0.20,
         sharpen=0.80,
-        skin=0.98,
-        green=1.02,
-        water=0.08,
+        skin=1.02,
+        green=1.06,
+        water=1.08,
         upper=0.14,
         tone=0.35,
     ),
@@ -1695,17 +1782,17 @@ SCENE_PROFILES = {
     "city": dict(
         exposure=0.02,
         contrast=1.05,
-        saturation=1.01,
+        saturation=1.06,
         highlight=0.40,
         shadow=0.025,
         subject=0.05,
         subject_contrast=1.02,
-        background=0.012,
+        background=0.007,
         denoise=0.24,
         sharpen=0.75,
-        skin=0.98,
-        green=1.01,
-        water=0.07,
+        skin=1.02,
+        green=1.04,
+        water=1.06,
         upper=0.13,
         tone=0.32,
     ),
@@ -1713,17 +1800,17 @@ SCENE_PROFILES = {
     "indoor": dict(
         exposure=0.03,
         contrast=1.03,
-        saturation=0.99,
+        saturation=1.05,
         highlight=0.35,
         shadow=0.030,
         subject=0.05,
         subject_contrast=1.02,
-        background=0.012,
+        background=0.007,
         denoise=0.28,
         sharpen=0.60,
-        skin=0.97,
-        green=1.00,
-        water=0.05,
+        skin=1.02,
+        green=1.03,
+        water=1.04,
         upper=0.10,
         tone=0.30,
     ),
@@ -1731,17 +1818,17 @@ SCENE_PROFILES = {
     "general": dict(
         exposure=0.00,
         contrast=1.04,
-        saturation=1.00,
+        saturation=1.07,
         highlight=0.30,
         shadow=0.025,
         subject=0.04,
         subject_contrast=1.02,
-        background=0.010,
+        background=0.006,
         denoise=0.22,
         sharpen=0.75,
-        skin=0.98,
-        green=1.01,
-        water=0.06,
+        skin=1.02,
+        green=1.04,
+        water=1.06,
         upper=0.12,
         tone=0.30,
     ),
@@ -2010,6 +2097,21 @@ def apply_tone(
 # Region processing
 # ============================================================
 
+def apply_luma_ratio(
+    image: np.ndarray,
+    new_y: np.ndarray,
+    weight: np.ndarray,
+) -> np.ndarray:
+    """Apply a luminance-only change, faded by a soft weight."""
+
+    y = luminance(image)
+    blended_y = y * (1.0 - weight) + new_y * weight
+    blended_y = np.clip(blended_y, 0.0, 1.0)
+    ratio = blended_y / np.maximum(y, 1e-6)
+    out = image * ratio[..., None]
+    return np.clip(out, 0.0, 1.0)
+
+
 def apply_region_processing(
     image: np.ndarray,
     masks: dict[str, np.ndarray],
@@ -2018,8 +2120,33 @@ def apply_region_processing(
 
     out = image.copy()
 
-    subject = masks["subject"]
-    background = masks["background"]
+    subject_hard = masks["subject"].astype(bool)
+    background_hard = masks["background"].astype(bool)
+
+    radius = mask_feather_radius(out.shape)
+
+    # Pull the subject inward first. DeepLab person masks on a dirt
+    # infield typically leak a ring of terracotta clay; lifting that
+    # ring and suppressing the dirt next to it is what draws the
+    # visible outline around players.
+    erode_px = int(clamp(radius * 0.35, 3.0, 14.0))
+    subject_core = erode_bool_mask(subject_hard, erode_px)
+    subject_w = soften_mask(subject_core, radius)
+
+    # Background is the complement of the *soft* subject so the two
+    # corrections cross-fade instead of meeting at a hard cut.
+    background_w = np.clip(1.0 - subject_w, 0.0, 1.0)
+    if np.any(background_hard):
+        background_w = np.minimum(
+            background_w,
+            soften_mask(background_hard, radius),
+        )
+
+    print(
+        f"Soft masks: feather {radius:.1f}px, "
+        f"subject erode {erode_px}px, "
+        f"subject mean {float(np.mean(subject_w)):.4f}"
+    )
 
     # --------------------------------------------------------
     # Subject luminance / contrast
@@ -2031,15 +2158,12 @@ def apply_region_processing(
     # scenes where the detected subject is substantially darker than the
     # intended subject target. The correction is deliberately capped and
     # reduced when the subject already contains bright pixels.
-    if np.any(subject):
-        pix = out[subject]
-        y = luminance(pix)
-
-        y2 = (
-            (y - 0.18)
-            * params.subject_contrast
-            + 0.18
-        )
+    #
+    # v28: apply through a feathered weight so the correction never
+    # steps at the segmentation boundary.
+    if float(np.max(subject_w)) > 1e-4:
+        y_full = luminance(out)
+        y = y_full[subject_hard] if np.any(subject_hard) else y_full
 
         subject_median = float(np.median(y))
         subject_p95 = float(np.percentile(y, 95))
@@ -2072,30 +2196,25 @@ def apply_region_processing(
         else:
             adaptive_ev = 0.0
             effective_subject_ev = params.subject_exposure
+            subject_target = 0.25
 
+        y2 = (
+            (y_full - 0.18)
+            * params.subject_contrast
+            + 0.18
+        )
         y2 *= 2.0 ** effective_subject_ev
         y2 = np.clip(y2, 0, 1)
 
         # ----------------------------------------------------
         # v26: subject-internal shadow lift
         # ----------------------------------------------------
-        # A whole-subject exposure correction is not enough when a person
-        # contains both bright areas (for example a white uniform) and
-        # dark areas (face, helmet, blue jersey, etc.).  In that case the
-        # subject median can already be acceptable while the important
-        # dark detail remains buried.
-        #
-        # Lift only the lower luminance range and smoothly reduce the
-        # correction toward the midtones.  This keeps bright clothing and
-        # reflective objects largely unchanged.  The operation is
-        # luminance-only, so RGB ratios are preserved.
         dark_weight = np.clip(
             (0.34 - y2) / 0.34,
             0.0,
             1.0,
         )
 
-        # Additional protection above the midtones.
         dark_weight *= np.clip(
             (0.45 - y2) / 0.25,
             0.0,
@@ -2113,25 +2232,18 @@ def apply_region_processing(
             1,
         )
 
-        shadow_pixels_before = y2 < 0.20
-        shadow_pixels_after = y3 < 0.20
+        shadow_pixels_before = y2[subject_hard] < 0.20 if np.any(subject_hard) else np.array([], dtype=bool)
+        shadow_pixels_after = y3[subject_hard] < 0.20 if np.any(subject_hard) else np.array([], dtype=bool)
 
-        ratio = y3 / np.maximum(y, 1e-6)
-        pix = pix * ratio[:, None]
-
-        out[subject] = np.clip(
-            pix,
-            0,
-            1,
-        )
+        out = apply_luma_ratio(out, y3, subject_w)
 
         shadow_median_before = (
-            float(np.median(y2[shadow_pixels_before]))
+            float(np.median(y2[subject_hard][shadow_pixels_before]))
             if np.any(shadow_pixels_before)
             else None
         )
         shadow_median_after = (
-            float(np.median(y3[shadow_pixels_before]))
+            float(np.median(y3[subject_hard][shadow_pixels_before]))
             if np.any(shadow_pixels_before)
             else None
         )
@@ -2159,20 +2271,16 @@ def apply_region_processing(
     # --------------------------------------------------------
     # v27: face shadow lift
     # --------------------------------------------------------
-    # The person-level correction above deliberately targets the whole
-    # subject.  v27 adds a second, much weaker correction for a confident
-    # face candidate so that facial/helmet-adjacent shadows can be opened
-    # without lifting bright uniforms.
     face = masks.get("face")
     face_confidence = float(masks.get("face_confidence", 0.0))
 
     if face is not None and np.any(face) and face_confidence >= 0.48:
-        pix = out[face]
-        y = luminance(pix)
-        face_median_before = float(np.median(y))
+        face_w = soften_mask(face, max(radius * 0.65, 8.0))
+        y = luminance(out)
+        face_median_before = float(np.median(y[face.astype(bool)]))
 
         # Strongest below 0.18, fading to zero by 0.36.
-        weight = np.clip(
+        lift_w = np.clip(
             (0.36 - y) / 0.18,
             0.0,
             1.0,
@@ -2181,14 +2289,12 @@ def apply_region_processing(
         # Confidence limits the maximum lift.  At confidence 1 the
         # maximum multiplicative gain is about +0.12 EV equivalent.
         max_gain = 1.0 + 0.12 * clamp(face_confidence, 0.0, 1.0)
-        gain = 1.0 + (max_gain - 1.0) * weight
-
+        gain = 1.0 + (max_gain - 1.0) * lift_w
         y2 = np.clip(y * gain, 0, 1)
-        ratio = y2 / np.maximum(y, 1e-6)
-        pix = pix * ratio[:, None]
-        out[face] = np.clip(pix, 0, 1)
 
-        face_median_after = float(np.median(y2))
+        out = apply_luma_ratio(out, y2, face_w)
+
+        face_median_after = float(np.median(y2[face.astype(bool)]))
 
         print(
             f"Face shadow lift: confidence {face_confidence:.3f}, "
@@ -2205,78 +2311,63 @@ def apply_region_processing(
     # --------------------------------------------------------
     # Background suppression
     # --------------------------------------------------------
-    # Again, only luminance is changed.
-    if np.any(background):
-        pix = out[background]
-        y = luminance(pix)
-
-        y2 = y * (
-            1.0
-            - params.background_suppression
-        )
-        y2 = np.clip(y2, 0, 1)
-
-        ratio = y2 / np.maximum(y, 1e-6)
-        pix = pix * ratio[:, None]
-
-        out[background] = np.clip(
-            pix,
+    # Again, only luminance is changed. Soft weight prevents a dark
+    # halo from forming against the lifted subject.
+    if float(np.max(background_w)) > 1e-4 and params.background_suppression > 0:
+        y = luminance(out)
+        y2 = np.clip(
+            y * (1.0 - params.background_suppression),
             0,
             1,
         )
+        out = apply_luma_ratio(out, y2, background_w)
 
     # --------------------------------------------------------
     # Saturation regions
     # --------------------------------------------------------
     # Combine all saturation adjustments into one operation per pixel.
-    # The old sequential skin -> green -> water processing could modify
-    # the same pixel multiple times. Here the masks have an explicit
-    # priority, so there is no cumulative chroma drift.
+    # Soft masks so grass / skin / water do not print a class edge.
+    # Priority: green < water < skin.
+    green_w = soften_mask(masks["green"], radius)
+    water_w = soften_mask(masks["water"], radius)
+    skin_w = soften_mask(masks["skin"], max(radius * 0.75, 8.0))
+
     saturation_factor = np.ones(
         out.shape[:2],
         dtype=np.float32,
     )
 
-    skin = masks["skin"]
-    green = masks["green"]
-    water = masks["water"]
-
-    # Skin has the highest priority, then water, then green.
-    saturation_factor[green] = params.green_saturation
-    saturation_factor[water] = params.water_saturation
-    saturation_factor[skin] = params.skin_saturation
-
-    active = (
-        saturation_factor
-        != 1.0
+    saturation_factor = (
+        saturation_factor * (1.0 - green_w)
+        + params.green_saturation * green_w
+    )
+    saturation_factor = (
+        saturation_factor * (1.0 - water_w)
+        + params.water_saturation * water_w
+    )
+    saturation_factor = (
+        saturation_factor * (1.0 - skin_w)
+        + params.skin_saturation * skin_w
     )
 
-    if np.any(active):
-        pix = out[active]
-        y = luminance(pix)
-        factor = saturation_factor[active]
-
-        pix = (
-            y[:, None]
-            + (pix - y[:, None])
-            * factor[:, None]
+    delta = np.abs(saturation_factor - 1.0)
+    if float(np.max(delta)) > 1e-5:
+        y = luminance(out)
+        out = (
+            y[..., None]
+            + (out - y[..., None])
+            * saturation_factor[..., None]
         )
-
-        out[active] = np.clip(
-            pix,
-            0,
-            1,
-        )
+        out = np.clip(out, 0, 1)
 
     # --------------------------------------------------------
     # Upper bright area
     # --------------------------------------------------------
     # Brightness only; chroma ratios are preserved.
-    upper = masks["upper_bright"]
+    upper_w = soften_mask(masks["upper_bright"], radius)
 
-    if np.any(upper):
-        pix = out[upper]
-        y = luminance(pix)
+    if float(np.max(upper_w)) > 1e-4:
+        y = luminance(out)
 
         lift = (
             1.0
@@ -2288,20 +2379,8 @@ def apply_region_processing(
             )
         )
 
-        y2 = np.clip(
-            y * lift,
-            0,
-            1,
-        )
-
-        ratio = y2 / np.maximum(y, 1e-6)
-        pix = pix * ratio[:, None]
-
-        out[upper] = np.clip(
-            pix,
-            0,
-            1,
-        )
+        y2 = np.clip(y * lift, 0, 1)
+        out = apply_luma_ratio(out, y2, upper_w)
 
     return np.clip(
         out,
@@ -2619,10 +2698,10 @@ def score_candidate(
     ) * 0.5
 
     # Saturation.
-    if stats.saturation_ratio > 0.75:
+    if stats.saturation_ratio > 0.88:
         score -= (
             stats.saturation_ratio
-            - 0.75
+            - 0.88
         )
 
     # Subject.
@@ -2685,9 +2764,10 @@ def automatic_parameter_search(
     ]
 
     saturations = [
-        0.97,
         1.00,
-        1.03,
+        1.04,
+        1.08,
+        1.12,
     ]
 
     subject_mask = masks.get(
@@ -3579,7 +3659,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Automatic RAW developer v23"
+            "Automatic RAW developer v28"
         )
     )
 
