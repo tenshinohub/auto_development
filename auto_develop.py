@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Automatic RAW Developer v28
+Automatic RAW Developer v29
 
 Pipeline
 --------
@@ -1613,14 +1613,29 @@ def classify_scene(
         np.mean(masks["vehicle"])
     )
 
-    # Portrait
+    # Portrait only when one person really dominates the frame.
+    # A baseball play, street scene, or group shot has several
+    # person blobs; treating all of them as a studio subject is
+    # what made players look pasted onto the field.
+    person_u8 = masks["person"].astype(np.uint8)
+    n_person, _, person_stats, _ = cv2.connectedComponentsWithStats(
+        person_u8,
+        connectivity=8,
+    )
+
+    largest_person = 0.0
+    if n_person > 1:
+        areas = person_stats[1:, cv2.CC_STAT_AREA].astype(np.float32)
+        largest_person = float(np.max(areas) / max(person_u8.size, 1))
+
     if (
-        person_area > 0.015
+        largest_person > 0.10
         and stats.median > 0.08
+        and (shooting.shallow_dof or largest_person > 0.20)
     ):
         confidence = clamp(
-            0.55
-            + person_area * 1.5
+            0.50
+            + largest_person * 1.5
             + (0.15 if shooting.shallow_dof else 0),
             0,
             1,
@@ -1708,129 +1723,129 @@ def classify_scene(
 
 SCENE_PROFILES = {
     "portrait": dict(
-        exposure=0.00,
+        exposure=0.04,
         contrast=1.02,
         saturation=1.05,
-        highlight=0.35,
-        shadow=0.025,
-        subject=0.08,
-        subject_contrast=1.02,
-        background=0.008,
+        highlight=0.28,
+        shadow=0.040,
+        subject=0.03,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.28,
         sharpen=0.75,
         skin=1.02,
         green=1.03,
         water=1.06,
-        upper=0.10,
-        tone=0.30,
+        upper=0.08,
+        tone=0.26,
     ),
 
     "night": dict(
-        exposure=0.00,
-        contrast=1.04,
+        exposure=0.06,
+        contrast=1.03,
         saturation=1.07,
-        highlight=0.45,
-        shadow=0.015,
-        subject=0.05,
-        subject_contrast=1.02,
-        background=0.006,
+        highlight=0.32,
+        shadow=0.035,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.30,
         sharpen=0.45,
         skin=1.02,
         green=1.03,
         water=1.06,
-        upper=0.14,
-        tone=0.30,
+        upper=0.10,
+        tone=0.26,
     ),
 
     "sunset": dict(
-        exposure=-0.02,
+        exposure=0.02,
         contrast=1.05,
         saturation=1.10,
-        highlight=0.45,
-        shadow=0.025,
-        subject=0.05,
-        subject_contrast=1.02,
-        background=0.006,
+        highlight=0.38,
+        shadow=0.035,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.20,
         sharpen=0.75,
         skin=1.03,
         green=1.04,
         water=1.08,
-        upper=0.16,
-        tone=0.35,
+        upper=0.12,
+        tone=0.32,
     ),
 
     "landscape": dict(
-        exposure=0.02,
-        contrast=1.06,
+        exposure=0.06,
+        contrast=1.05,
         saturation=1.09,
-        highlight=0.35,
-        shadow=0.035,
-        subject=0.05,
-        subject_contrast=1.02,
-        background=0.006,
+        highlight=0.28,
+        shadow=0.045,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.20,
         sharpen=0.80,
         skin=1.02,
         green=1.06,
         water=1.08,
-        upper=0.14,
-        tone=0.35,
+        upper=0.10,
+        tone=0.32,
     ),
 
     "city": dict(
-        exposure=0.02,
-        contrast=1.05,
+        exposure=0.06,
+        contrast=1.04,
         saturation=1.06,
-        highlight=0.40,
-        shadow=0.025,
-        subject=0.05,
-        subject_contrast=1.02,
-        background=0.007,
+        highlight=0.30,
+        shadow=0.040,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.24,
         sharpen=0.75,
         skin=1.02,
         green=1.04,
         water=1.06,
-        upper=0.13,
-        tone=0.32,
+        upper=0.10,
+        tone=0.28,
     ),
 
     "indoor": dict(
-        exposure=0.03,
+        exposure=0.08,
         contrast=1.03,
         saturation=1.05,
-        highlight=0.35,
-        shadow=0.030,
-        subject=0.05,
-        subject_contrast=1.02,
-        background=0.007,
+        highlight=0.28,
+        shadow=0.045,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.28,
         sharpen=0.60,
         skin=1.02,
         green=1.03,
         water=1.04,
-        upper=0.10,
-        tone=0.30,
+        upper=0.08,
+        tone=0.26,
     ),
 
     "general": dict(
-        exposure=0.00,
+        exposure=0.06,
         contrast=1.04,
         saturation=1.07,
-        highlight=0.30,
-        shadow=0.025,
-        subject=0.04,
-        subject_contrast=1.02,
-        background=0.006,
+        highlight=0.26,
+        shadow=0.040,
+        subject=0.02,
+        subject_contrast=1.00,
+        background=0.000,
         denoise=0.22,
         sharpen=0.75,
         skin=1.02,
         green=1.04,
         water=1.06,
-        upper=0.12,
-        tone=0.30,
+        upper=0.08,
+        tone=0.26,
     ),
 }
 
@@ -1844,24 +1859,24 @@ def calculate_exposure_target(
 ) -> float:
 
     targets = {
-        "portrait": 0.220,
-        "night": 0.100,
-        "sunset": 0.160,
-        "landscape": 0.220,
-        "city": 0.210,
-        "indoor": 0.200,
-        "general": 0.210,
+        "portrait": 0.255,
+        "night": 0.165,
+        "sunset": 0.200,
+        "landscape": 0.250,
+        "city": 0.245,
+        "indoor": 0.240,
+        "general": 0.245,
     }
 
     target = targets.get(
         scene,
-        0.210,
+        0.245,
     )
 
     return clamp(
         target,
-        0.085,
-        0.235,
+        0.12,
+        0.28,
     )
 
 
@@ -1887,8 +1902,8 @@ def estimate_exposure_ev(
         / max(stats.median, 1e-5)
     )
 
-    highlight_soft = 0.680
-    highlight_hard = 0.820
+    highlight_soft = 0.740
+    highlight_hard = 0.880
 
     if stats.p95 > highlight_soft:
         highlight_ev = math.log2(
@@ -1899,33 +1914,33 @@ def estimate_exposure_ev(
         highlight_ev = 0.0
 
     if stats.p99 > highlight_hard:
-        hard_penalty = -0.35
+        hard_penalty = -0.25
     else:
         hard_penalty = 0.0
 
     ev = (
-        median_ev * 0.70
-        + highlight_ev * 0.30
+        median_ev * 0.78
+        + highlight_ev * 0.22
         + hard_penalty
     )
 
     # Use available highlight headroom more aggressively.
     if stats.p99 < 0.40:
-        ev += 0.25
-    elif stats.p99 < 0.45:
-        ev += 0.20
+        ev += 0.32
     elif stats.p99 < 0.50:
-        ev += 0.15
+        ev += 0.24
     elif stats.p99 < 0.60:
+        ev += 0.16
+    elif stats.p99 < 0.70:
         ev += 0.08
 
-    if median_error > 0.03:
-        ev += 0.05
+    if median_error > 0.02:
+        ev += 0.08
 
     return clamp(
         ev,
-        -0.75,
-        1.00,
+        -0.60,
+        1.20,
     )
 
 
@@ -2169,8 +2184,8 @@ def apply_region_processing(
         subject_p95 = float(np.percentile(y, 95))
 
         if subject_median > 1e-5:
-            if subject_median < 0.25:
-                subject_target = 0.25
+            if subject_median < 0.22:
+                subject_target = 0.22
             else:
                 subject_target = subject_median
 
@@ -2178,9 +2193,9 @@ def apply_region_processing(
                 math.log2(
                     subject_target
                     / max(subject_median, 1e-5)
-                ) * 0.70,
+                ) * 0.40,
                 0.0,
-                0.25,
+                0.10,
             )
 
             # Protect bright uniforms / reflective objects.
@@ -2196,7 +2211,7 @@ def apply_region_processing(
         else:
             adaptive_ev = 0.0
             effective_subject_ev = params.subject_exposure
-            subject_target = 0.25
+            subject_target = 0.22
 
         y2 = (
             (y_full - 0.18)
@@ -2223,7 +2238,7 @@ def apply_region_processing(
 
         shadow_gain = (
             1.0
-            + 0.16 * dark_weight
+            + 0.07 * dark_weight
         )
 
         y3 = np.clip(
@@ -2253,7 +2268,7 @@ def apply_region_processing(
             f"base {params.subject_exposure:+.3f} EV, "
             f"adaptive {adaptive_ev:+.3f} EV, "
             f"subject median {subject_median:.3f} -> "
-            f"target {min(subject_target, 0.25):.3f}"
+            f"target {min(subject_target, 0.22):.3f}"
         )
 
         print(
@@ -2288,7 +2303,7 @@ def apply_region_processing(
 
         # Confidence limits the maximum lift.  At confidence 1 the
         # maximum multiplicative gain is about +0.12 EV equivalent.
-        max_gain = 1.0 + 0.12 * clamp(face_confidence, 0.0, 1.0)
+        max_gain = 1.0 + 0.06 * clamp(face_confidence, 0.0, 1.0)
         gain = 1.0 + (max_gain - 1.0) * lift_w
         y2 = np.clip(y * gain, 0, 1)
 
@@ -2667,22 +2682,22 @@ def score_candidate(
 
     # Prefer a useful overall brightness when the image has
     # substantial highlight headroom.
-    if stats.p99 < 0.50:
+    if stats.p99 < 0.62:
         score += min(
-            0.08,
-            (0.50 - stats.p99) * 0.20,
+            0.14,
+            (0.62 - stats.p99) * 0.28,
         )
 
     # Highlight protection.
-    if stats.p95 > 0.68:
+    if stats.p95 > 0.78:
         score -= (
-            stats.p95 - 0.68
-        ) * 5.0
+            stats.p95 - 0.78
+        ) * 3.5
 
-    if stats.p99 > 0.82:
+    if stats.p99 > 0.90:
         score -= (
-            stats.p99 - 0.82
-        ) * 7.0
+            stats.p99 - 0.90
+        ) * 5.0
 
     # Avoid crushed shadows.
     if stats.shadow_ratio > 0.12:
@@ -2718,18 +2733,18 @@ def score_candidate(
         )
 
         subject_target = (
-            0.285
+            0.26
             if scene == "portrait"
             else min(
-                target + 0.04,
-                0.27,
+                target + 0.02,
+                0.26,
             )
         )
 
         score -= abs(
             subject_median
             - subject_target
-        ) * 2.0
+        ) * 0.8
 
     return float(score)
 
@@ -2747,13 +2762,13 @@ def automatic_parameter_search(
     )
 
     offsets = [
-        -0.25,
         -0.15,
         -0.08,
         0.00,
         0.08,
-        0.15,
+        0.16,
         0.25,
+        0.35,
     ]
 
     contrasts = [
@@ -3186,15 +3201,15 @@ class AutoDeveloper:
         )
 
         if scene == "portrait":
-            subject_target = 0.285
+            subject_target = 0.260
         elif scene == "night":
-            subject_target = 0.16
+            subject_target = 0.20
         elif scene == "indoor":
-            subject_target = 0.24
+            subject_target = 0.25
         else:
             subject_target = min(
-                target + 0.04,
-                0.27,
+                target + 0.02,
+                0.26,
             )
 
         print(
@@ -3204,12 +3219,12 @@ class AutoDeveloper:
 
         print(
             f"Highlight soft     : "
-            f"{0.680:.3f}"
+            f"{0.740:.3f}"
         )
 
         print(
             f"Highlight hard     : "
-            f"{0.820:.3f}"
+            f"{0.880:.3f}"
         )
 
         print(
@@ -3466,7 +3481,7 @@ class AutoDeveloper:
             - final_stats_before_feedback.median
         )
 
-        if final_error > 0.015:
+        if final_error > 0.010:
             correction_ev = clamp(
                 math.log2(
                     max(final_target, 1e-5)
@@ -3474,15 +3489,15 @@ class AutoDeveloper:
                         final_stats_before_feedback.median,
                         1e-5,
                     )
-                ) * 0.55,
+                ) * 0.75,
                 0.0,
-                0.30,
+                0.45,
             )
 
             # Never use the feedback to push an already bright/highlighted
             # image upward.
             if (
-                final_stats_before_feedback.p99 < 0.65
+                final_stats_before_feedback.p99 < 0.78
                 and correction_ev > 0.0
             ):
                 current = apply_exposure(
@@ -3659,7 +3674,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Automatic RAW developer v28"
+            "Automatic RAW developer v29"
         )
     )
 
