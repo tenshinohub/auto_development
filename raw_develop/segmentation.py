@@ -7,6 +7,8 @@ import torch
 import torchvision
 from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
 
+from .utils import normalize_image
+
 class Segmenter:
     def __init__(
         self,
@@ -16,6 +18,8 @@ class Segmenter:
         if device == "auto":
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
+            elif torch.xpu.is_available():
+                self.device = torch.device("xpu")
             else:
                 self.device = torch.device("cpu")
         elif device == "cuda":
@@ -24,6 +28,14 @@ class Segmenter:
             else:
                 print(
                     "CUDA is not available. Falling back to CPU."
+                )
+                self.device = torch.device("cpu")
+        elif device == "xpu":
+            if torch.xpu.is_available():
+                self.device = torch.device("xpu")
+            else:
+                print(
+                    "XPU is not available. Falling back to CPU."
                 )
                 self.device = torch.device("cpu")
         else:

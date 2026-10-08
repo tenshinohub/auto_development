@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
 RAW_EXTENSIONS = {
     ".cr2",
     ".cr3",
@@ -59,7 +62,7 @@ VEHICLE_CLASSES = {
 
 PERSON_CLASSES = {"person"}
 
-
+@dataclass
 class ExifMetadata:
     camera_make: str = ""
     camera_model: str = ""
@@ -70,11 +73,13 @@ class ExifMetadata:
     width: int = 0
     height: int = 0
 
+@dataclass
 class CameraProfile:
     make: str = ""
     model: str = ""
     family: str = "generic"
 
+@dataclass
 class ImageStats:
     mean: float
     median: float
@@ -105,6 +110,7 @@ class ImageStats:
     # v23
     warm_ratio: float
 
+@dataclass
 class ShootingCondition:
     iso_factor: float
     low_light: bool
@@ -114,6 +120,7 @@ class ShootingCondition:
     telephoto: bool
     estimated_noise: float
 
+@dataclass
 class SubjectCandidate:
     label: str
     class_id: int
@@ -124,16 +131,19 @@ class SubjectCandidate:
     saliency_score: float
     local_contrast: float
 
+@dataclass
 class SceneResult:
     scene: str
     confidence: float
 
+@dataclass
 class RegionStats:
     subject_median: Optional[float]
     background_median: Optional[float]
     subject_area: float
     background_area: float
 
+@dataclass
 class DevelopParams:
     exposure_ev: float
     contrast: float

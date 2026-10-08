@@ -12,13 +12,13 @@ def calculate_exposure_target(
 ) -> float:
 
     targets = {
-        "portrait": 0.255,
-        "night": 0.165,
-        "sunset": 0.200,
-        "landscape": 0.250,
-        "city": 0.245,
-        "indoor": 0.240,
-        "general": 0.245,
+        "portrait": 0.305,
+        "night": 0.205,
+        "sunset": 0.255,
+        "landscape": 0.305,
+        "city": 0.300,
+        "indoor": 0.295,
+        "general": 0.300,
     }
 
     target = targets.get(
@@ -29,7 +29,7 @@ def calculate_exposure_target(
     return clamp(
         target,
         0.12,
-        0.28,
+        0.34,
     )
 
 

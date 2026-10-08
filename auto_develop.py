@@ -30,7 +30,7 @@ def main():
 
     parser.add_argument(
         "--device",
-        choices=["auto", "cpu", "cuda"],
+        choices=["auto", "cpu", "cuda", "xpu"],
         default="auto",
         help="Segmentation device",
     )
